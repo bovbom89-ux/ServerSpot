@@ -1,0 +1,12 @@
+{
+  "name": "serverspot-bot",
+  "version": "1.0.0",
+  "description": "Discover, advertise and connect with Discord communities through ServerSpot.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.22.1"
+  }
+}
