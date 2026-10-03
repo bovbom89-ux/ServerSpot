@@ -1,1648 +1,1054 @@
 const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  REST,
-  Routes,
-  SlashCommandBuilder,
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
-  PermissionFlagsBits,
-  ChannelType
+    Client,
+    GatewayIntentBits,
+    Partials,
+    REST,
+    Routes,
+    SlashCommandBuilder,
+    PermissionFlagsBits,
+    EmbedBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle,
+    ChannelType
 } = require("discord.js");
 
 const fs = require("fs");
-const path = require("path");
-const https = require("https");
+const http = require("http");
 
-const TOKEN = process.env.TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
+// ======================================================
+// SERVERSPOT CONFIGURATION
+// ======================================================
 
-const BRAND = "#E00000";
-const DATA_FILE = path.join(__dirname, "serverspot-data.json");
+const TOKEN =
+    process.env.TOKEN ||
+    process.env.DISCORD_TOKEN ||
+    process.env.BOT_TOKEN;
 
 if (!TOKEN) {
-  console.error("Missing TOKEN environment variable.");
-  process.exit(1);
+    console.error("Missing Discord bot token.");
+    console.error("Add TOKEN to your Render environment variables.");
+    process.exit(1);
 }
 
-if (!CLIENT_ID) {
-  console.error("Missing CLIENT_ID environment variable.");
-  process.exit(1);
-}
+const CLIENT_ID = process.env.CLIENT_ID || process.env.DISCORD_CLIENT_ID;
+
+const PORT = process.env.PORT || 3000;
+
+const COLOUR = 0xE00000;
+
+// ======================================================
+// SIMPLE WEB SERVER FOR RENDER
+// ======================================================
+
+http.createServer((req, res) => {
+    res.writeHead(200, {
+        "Content-Type": "text/plain"
+    });
+
+    res.end("ServerSpot is online.");
+}).listen(PORT, "0.0.0.0", () => {
+    console.log(`Web server listening on port ${PORT}`);
+});
+
+// ======================================================
+// CLIENT
+// ======================================================
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers
-  ],
-  partials: [Partials.Channel]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers
+    ],
+    partials: [
+        Partials.Channel
+    ]
 });
 
-/* ---------------- DATA ---------------- */
+// ======================================================
+// CONFIG STORAGE
+// ======================================================
 
-function defaultData() {
-  return {
-    guilds: {},
-    advertisements: {},
-    blacklist: [],
-    users: {},
-    nextAdvertisementId: 1
-  };
-}
+const CONFIG_FILE = "./serverspot-config.json";
 
-function loadData() {
-  try {
-    if (!fs.existsSync(DATA_FILE)) {
-      const data = defaultData();
-      fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-      return data;
-    }
+let configurations = {};
 
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  } catch (error) {
-    console.error("Failed to load data:", error);
-    return defaultData();
-  }
-}
-
-let db = loadData();
-
-function saveData() {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
-  } catch (error) {
-    console.error("Failed to save data:", error);
-  }
-}
-
-/* ---------------- HELPERS ---------------- */
-
-function getGuildConfig(guildId) {
-  if (!db.guilds[guildId]) {
-    db.guilds[guildId] = {
-      logsChannel: null,
-      featuredChannel: null,
-      staffRole: null,
-      reportChannel: null,
-      suggestionChannel: null
-    };
-
-    saveData();
-  }
-
-  return db.guilds[guildId];
-}
-
-function isStaff(interaction) {
-  const config = getGuildConfig(interaction.guild.id);
-
-  if (interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
-    return true;
-  }
-
-  if (config.staffRole && interaction.member.roles.cache.has(config.staffRole)) {
-    return true;
-  }
-
-  return false;
-}
-
-function cleanInvite(invite) {
-  return invite
-    .trim()
-    .replace(/^https?:\/\//i, "")
-    .replace(/^discord\.gg\//i, "")
-    .replace(/^discord\.com\/invite\//i, "")
-    .split(/[/?#]/)[0];
-}
-
-function validInvite(invite) {
-  const cleaned = cleanInvite(invite);
-  return /^[a-zA-Z0-9-]+$/.test(cleaned) && cleaned.length >= 2;
-}
-
-function makeId() {
-  const id = String(db.nextAdvertisementId++).padStart(5, "0");
-  saveData();
-  return `SS-${id}`;
-}
-
-function ensureUser(userId) {
-  if (!db.users[userId]) {
-    db.users[userId] = {
-      submitted: 0,
-      accepted: 0,
-      declined: 0,
-      reports: 0,
-      joined: Date.now()
-    };
-
-    saveData();
-  }
-
-  return db.users[userId];
-}
-
-function formatNumber(number) {
-  return Number(number || 0).toLocaleString("en-GB");
-}
-
-function truncate(text, length = 1000) {
-  if (!text) return "Not provided";
-  return text.length > length
-    ? `${text.slice(0, length - 3)}...`
-    : text;
-}
-
-function baseEmbed(title, description) {
-  return new EmbedBuilder()
-    .setColor(BRAND)
-    .setTitle(title)
-    .setDescription(description || "")
-    .setTimestamp()
-    .setFooter({ text: "ServerSpot • Discover. Advertise. Connect." });
-}
-
-async function safeReply(interaction, payload) {
-  try {
-    if (interaction.replied || interaction.deferred) {
-      return await interaction.editReply(payload);
-    }
-
-    return await interaction.reply(payload);
-  } catch (error) {
-    if (error.code === 10062) {
-      console.warn("Interaction expired before it could be answered.");
-      return null;
-    }
-
-    console.error("Interaction response error:", error);
-    return null;
-  }
-}
-
-async function safeFollowUp(interaction, payload) {
-  try {
-    return await interaction.followUp(payload);
-  } catch (error) {
-    console.error("Follow-up error:", error);
-    return null;
-  }
-}
-
-/* ---------------- SERVER LOOKUP ---------------- */
-
-function discordApi(pathname) {
-  return new Promise((resolve, reject) => {
-    const request = https.request(
-      {
-        hostname: "discord.com",
-        path: `/api/v10${pathname}`,
-        method: "GET",
-        headers: {
-          Authorization: `Bot ${TOKEN}`,
-          "User-Agent": "ServerSpot/2.0"
+function loadConfigurations() {
+    try {
+        if (fs.existsSync(CONFIG_FILE)) {
+            configurations = JSON.parse(
+                fs.readFileSync(CONFIG_FILE, "utf8")
+            );
         }
-      },
-      response => {
-        let body = "";
-
-        response.on("data", chunk => {
-          body += chunk;
-        });
-
-        response.on("end", () => {
-          try {
-            const parsed = JSON.parse(body);
-
-            if (response.statusCode >= 200 && response.statusCode < 300) {
-              resolve(parsed);
-            } else {
-              reject({
-                status: response.statusCode,
-                data: parsed
-              });
-            }
-          } catch {
-            reject({
-              status: response.statusCode,
-              data: body
-            });
-          }
-        });
-      }
-    );
-
-    request.on("error", reject);
-    request.end();
-  });
+    } catch (error) {
+        console.error("Could not load configuration:", error);
+        configurations = {};
+    }
 }
 
-async function lookupInvite(inviteCode) {
-  return discordApi(
-    `/invites/${encodeURIComponent(inviteCode)}?with_counts=true&with_expiration=true`
-  );
+function saveConfigurations() {
+    try {
+        fs.writeFileSync(
+            CONFIG_FILE,
+            JSON.stringify(configurations, null, 2)
+        );
+    } catch (error) {
+        console.error("Could not save configuration:", error);
+    }
 }
 
-function serverStatus(inviteData) {
-  if (!inviteData || !inviteData.guild) {
-    return "Unavailable";
-  }
-
-  return "Online";
+function getConfig(guildId) {
+    return configurations[guildId] || {};
 }
 
-/* ---------------- COMMANDS ---------------- */
+loadConfigurations();
+
+// ======================================================
+// COMMANDS
+// ======================================================
 
 const commands = [
-  new SlashCommandBuilder()
-    .setName("advertise")
-    .setDescription("Submit a server advertisement to ServerSpot."),
 
-  new SlashCommandBuilder()
-    .setName("featured")
-    .setDescription("View a featured ServerSpot server."),
+    new SlashCommandBuilder()
+        .setName("advertise")
+        .setDescription("Submit your Discord server to ServerSpot."),
 
-  new SlashCommandBuilder()
-    .setName("servers")
-    .setDescription("Browse approved ServerSpot servers."),
+    new SlashCommandBuilder()
+        .setName("setup")
+        .setDescription("Configure ServerSpot for this server.")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addChannelOption(option =>
+            option
+                .setName("logs")
+                .setDescription("Channel where advertisement submissions are sent.")
+                .addChannelTypes(ChannelType.GuildText)
+                .setRequired(true)
+        )
+        .addChannelOption(option =>
+            option
+                .setName("featured")
+                .setDescription("Channel where approved advertisements are posted.")
+                .addChannelTypes(ChannelType.GuildText)
+                .setRequired(true)
+        )
+        .addRoleOption(option =>
+            option
+                .setName("staff")
+                .setDescription("Role allowed to approve or decline advertisements.")
+                .setRequired(true)
+        ),
 
-  new SlashCommandBuilder()
-    .setName("search")
-    .setDescription("Search approved ServerSpot servers.")
-    .addStringOption(option =>
-      option
-        .setName("query")
-        .setDescription("Server name or category")
-        .setRequired(true)
-    ),
+    new SlashCommandBuilder()
+        .setName("serverinfo")
+        .setDescription("View information about ServerSpot."),
 
-  new SlashCommandBuilder()
-    .setName("random")
-    .setDescription("Discover a random approved server."),
+    new SlashCommandBuilder()
+        .setName("ping")
+        .setDescription("Check ServerSpot's response time."),
 
-  new SlashCommandBuilder()
-    .setName("serverinfo")
-    .setDescription("View information about a ServerSpot server.")
-    .addStringOption(option =>
-      option
-        .setName("id")
-        .setDescription("Advertisement ID, e.g. SS-00001")
-        .setRequired(true)
-    ),
+    new SlashCommandBuilder()
+        .setName("config")
+        .setDescription("View the current ServerSpot configuration.")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 
-  new SlashCommandBuilder()
-    .setName("categories")
-    .setDescription("View ServerSpot categories."),
-
-  new SlashCommandBuilder()
-    .setName("myadvertisements")
-    .setDescription("View your ServerSpot advertisements."),
-
-  new SlashCommandBuilder()
-    .setName("profile")
-    .setDescription("View your ServerSpot profile."),
-
-  new SlashCommandBuilder()
-    .setName("report")
-    .setDescription("Report an advertised server.")
-    .addStringOption(option =>
-      option
-        .setName("id")
-        .setDescription("Advertisement ID")
-        .setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("suggest")
-    .setDescription("Send a suggestion to ServerSpot staff.")
-    .addStringOption(option =>
-      option
-        .setName("suggestion")
-        .setDescription("Your suggestion")
-        .setRequired(true)
-        .setMaxLength(1000)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("ping")
-    .setDescription("Check ServerSpot's latency."),
-
-  new SlashCommandBuilder()
-    .setName("about")
-    .setDescription("Learn about ServerSpot."),
-
-  new SlashCommandBuilder()
-    .setName("help")
-    .setDescription("View ServerSpot commands."),
-
-  new SlashCommandBuilder()
-    .setName("stats")
-    .setDescription("View ServerSpot statistics."),
-
-  new SlashCommandBuilder()
-    .setName("setup")
-    .setDescription("Configure ServerSpot.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator.toString())
-    .addChannelOption(option =>
-      option
-        .setName("logs")
-        .setDescription("Advertisement review/log channel")
-        .addChannelTypes(ChannelType.GuildText)
-        .setRequired(true)
-    )
-    .addChannelOption(option =>
-      option
-        .setName("featured")
-        .setDescription("Featured servers channel")
-        .addChannelTypes(ChannelType.GuildText)
-        .setRequired(true)
-    )
-    .addRoleOption(option =>
-      option
-        .setName("staff")
-        .setDescription("ServerSpot staff role")
-        .setRequired(true)
-    )
-    .addChannelOption(option =>
-      option
-        .setName("reports")
-        .setDescription("Report channel")
-        .addChannelTypes(ChannelType.GuildText)
-        .setRequired(false)
-    )
-    .addChannelOption(option =>
-      option
-        .setName("suggestions")
-        .setDescription("Suggestion channel")
-        .addChannelTypes(ChannelType.GuildText)
-        .setRequired(false)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("config")
-    .setDescription("View ServerSpot configuration.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator.toString()),
-
-  new SlashCommandBuilder()
-    .setName("feature")
-    .setDescription("Feature an approved advertisement.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator.toString())
-    .addStringOption(option =>
-      option
-        .setName("id")
-        .setDescription("Advertisement ID")
-        .setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("unfeature")
-    .setDescription("Remove an advertisement from featured status.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator.toString())
-    .addStringOption(option =>
-      option
-        .setName("id")
-        .setDescription("Advertisement ID")
-        .setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("blacklist")
-    .setDescription("Blacklist a Discord server invite.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator.toString())
-    .addStringOption(option =>
-      option
-        .setName("invite")
-        .setDescription("Server invite")
-        .setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("unblacklist")
-    .setDescription("Remove a server from the blacklist.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator.toString())
-    .addStringOption(option =>
-      option
-        .setName("invite")
-        .setDescription("Server invite")
-        .setRequired(true)
-    )
 ].map(command => command.toJSON());
 
-/* ---------------- REGISTER ---------------- */
+// ======================================================
+// READY
+// ======================================================
 
-async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
+client.once("clientReady", async () => {
 
-  try {
-    console.log("Registering ServerSpot commands...");
+    console.log(`ServerSpot is online as ${client.user.tag}`);
+    console.log(`Serving ${client.guilds.cache.size} server(s).`);
 
-    await rest.put(
-      Routes.applicationCommands(CLIENT_ID),
-      { body: commands }
-    );
+    try {
 
-    console.log("ServerSpot commands registered successfully.");
-  } catch (error) {
-    console.error("Command registration failed:", error);
-  }
-}
+        const rest = new REST({
+            version: "10"
+        }).setToken(TOKEN);
 
-/* ---------------- ADVERTISEMENT EMBED ---------------- */
+        if (CLIENT_ID) {
 
-function advertisementEmbed(ad, status = "Pending") {
-  const embed = new EmbedBuilder()
-    .setColor(BRAND)
-    .setTitle(`${ad.serverName}`)
-    .setDescription(truncate(ad.description, 4000))
-    .addFields(
-      {
-        name: "Status",
-        value: `[${status}]`,
-        inline: true
-      },
-      {
-        name: "Members",
-        value: `[${formatNumber(ad.members)}]`,
-        inline: true
-      },
-      {
-        name: "Category",
-        value: `[${ad.category}]`,
-        inline: true
-      },
-      {
-        name: "Advertisement ID",
-        value: `\`${ad.id}\``,
-        inline: true
-      },
-      {
-        name: "Submitted By",
-        value: `<@${ad.userId}>`,
-        inline: true
-      },
-      {
-        name: "Server Link",
-        value: `[Join Server](${ad.inviteUrl})`,
-        inline: true
-      }
-    )
-    .setTimestamp()
-    .setFooter({
-      text: "ServerSpot • Discover. Advertise. Connect."
-    });
+            for (const guild of client.guilds.cache.values()) {
 
-  if (ad.icon) {
-    embed.setThumbnail(ad.icon);
-  }
+                try {
 
-  if (ad.communityLink) {
-    embed.addFields({
-      name: "Community Link",
-      value: `[Open Community](${ad.communityLink})`,
-      inline: false
-    });
-  }
+                    await rest.put(
+                        Routes.applicationGuildCommands(
+                            CLIENT_ID,
+                            guild.id
+                        ),
+                        {
+                            body: commands
+                        }
+                    );
 
-  return embed;
-}
+                    console.log(
+                        `Commands registered in ${guild.name}`
+                    );
 
-function advertisementButtons(id, disabled = false) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`ad_accept:${id}`)
-      .setLabel("Accept")
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(disabled),
-
-    new ButtonBuilder()
-      .setCustomId(`ad_decline:${id}`)
-      .setLabel("Decline")
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled(disabled)
-  );
-}
-
-/* ---------------- READY ---------------- */
-
-client.once("ready", async () => {
-  console.log(`ServerSpot is online as ${client.user.tag}`);
-  console.log(`Serving ${client.guilds.cache.size} server(s).`);
-
-  await registerCommands();
-
-  client.user.setActivity("/help • Server discovery", {
-    type: 3
-  });
-});
-
-/* ---------------- INTERACTIONS ---------------- */
-
-client.on("interactionCreate", async interaction => {
-  try {
-    /* ---------- BUTTONS ---------- */
-
-    if (interaction.isButton()) {
-      const [action, id] = interaction.customId.split(":");
-
-      if (!action.startsWith("ad_")) return;
-
-      if (!isStaff(interaction)) {
-        return safeReply(interaction, {
-          content: "You do not have permission to review advertisements.",
-          ephemeral: true
-        });
-      }
-
-      const ad = db.advertisements[id];
-
-      if (!ad) {
-        return safeReply(interaction, {
-          content: "This advertisement could not be found.",
-          ephemeral: true
-        });
-      }
-
-      if (ad.status !== "pending") {
-        return safeReply(interaction, {
-          content: `This advertisement has already been **${ad.status}**.`,
-          ephemeral: true
-        });
-      }
-
-      if (action === "ad_accept") {
-        ad.status = "accepted";
-        ad.reviewedBy = interaction.user.id;
-        ad.reviewedAt = Date.now();
-
-        ensureUser(ad.userId).accepted++;
-
-        saveData();
-
-        const config = getGuildConfig(interaction.guild.id);
-
-        const featuredChannel =
-          config.featuredChannel
-            ? interaction.guild.channels.cache.get(config.featuredChannel)
-            : null;
-
-        const updatedEmbed = advertisementEmbed(ad, "Online");
-
-        if (featuredChannel) {
-          const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setLabel("Join Server")
-              .setStyle(ButtonStyle.Link)
-              .setURL(ad.inviteUrl)
-          );
-
-          if (ad.communityLink) {
-            row.addComponents(
-              new ButtonBuilder()
-                .setLabel("Community")
-                .setStyle(ButtonStyle.Link)
-                .setURL(ad.communityLink)
-            );
-          }
-
-          await featuredChannel.send({
-            embeds: [updatedEmbed],
-            components: [row]
-          });
-        }
-
-        await safeReply(interaction, {
-          content: `Advertisement **${id}** has been accepted.`,
-          ephemeral: true
-        });
-
-        try {
-          await interaction.message.edit({
-            embeds: [
-              advertisementEmbed(
-                ad,
-                "Accepted"
-              )
-            ],
-            components: [
-              advertisementButtons(id, true)
-            ]
-          });
-        } catch (error) {
-          console.error("Failed to update review message:", error);
-        }
-
-        return;
-      }
-
-      if (action === "ad_decline") {
-        const modal = new ModalBuilder()
-          .setCustomId(`decline_modal:${id}`)
-          .setTitle("Decline Advertisement");
-
-        const reason = new TextInputBuilder()
-          .setCustomId("reason")
-          .setLabel("Reason for declining")
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(true)
-          .setMaxLength(1000)
-          .setPlaceholder("Explain why this advertisement was declined.");
-
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(reason)
-        );
-
-        return interaction.showModal(modal);
-      }
-    }
-
-    /* ---------- MODAL ---------- */
-
-    if (interaction.isModalSubmit()) {
-      if (interaction.customId.startsWith("decline_modal:")) {
-        const id = interaction.customId.split(":")[1];
-        const ad = db.advertisements[id];
-
-        if (!ad) {
-          return safeReply(interaction, {
-            content: "Advertisement not found.",
-            ephemeral: true
-          });
-        }
-
-        if (!isStaff(interaction)) {
-          return safeReply(interaction, {
-            content: "You do not have permission to do this.",
-            ephemeral: true
-          });
-        }
-
-        if (ad.status !== "pending") {
-          return safeReply(interaction, {
-            content: "This advertisement has already been reviewed.",
-            ephemeral: true
-          });
-        }
-
-        const reason = interaction.fields.getTextInputValue("reason");
-
-        ad.status = "declined";
-        ad.reason = reason;
-        ad.reviewedBy = interaction.user.id;
-        ad.reviewedAt = Date.now();
-
-        ensureUser(ad.userId).declined++;
-
-        saveData();
-
-        await safeReply(interaction, {
-          content: `Advertisement **${id}** has been declined.`,
-          ephemeral: true
-        });
-
-        const config = getGuildConfig(interaction.guild.id);
-        const logs = config.logsChannel
-          ? interaction.guild.channels.cache.get(config.logsChannel)
-          : null;
-
-        if (logs) {
-          await logs.send({
-            embeds: [
-              baseEmbed(
-                "Advertisement Declined",
-                `Advertisement **${id}** has been declined.`
-              ).addFields(
-                {
-                  name: "Server",
-                  value: ad.serverName,
-                  inline: true
-                },
-                {
-                  name: "Submitted By",
-                  value: `<@${ad.userId}>`,
-                  inline: true
-                },
-                {
-                  name: "Reviewed By",
-                  value: `<@${interaction.user.id}>`,
-                  inline: true
-                },
-                {
-                  name: "Reason",
-                  value: truncate(reason, 1000)
+                } catch (error) {
+                    console.error(
+                        `Could not register commands in ${guild.name}:`,
+                        error.message
+                    );
                 }
-              )
-            ]
-          });
+            }
+
+        } else {
+
+            console.log(
+                "CLIENT_ID is missing. Commands cannot be registered automatically."
+            );
+
         }
 
-        try {
-          const message = await logs?.messages.fetch(ad.reviewMessageId);
-
-          if (message) {
-            await message.edit({
-              embeds: [
-                advertisementEmbed(ad, "Declined").addFields({
-                  name: "Decline Reason",
-                  value: truncate(reason, 1000)
-                })
-              ],
-              components: [
-                advertisementButtons(id, true)
-              ]
-            });
-          }
-        } catch {}
-
-        return;
-      }
+    } catch (error) {
+        console.error("Command registration error:", error);
     }
-
-    /* ---------- CHAT COMMANDS ---------- */
-
-    if (!interaction.isChatInputCommand()) return;
-
-    const command = interaction.commandName;
-
-    /* ADVERTISE */
-
-    if (command === "advertise") {
-      const modal = new ModalBuilder()
-        .setCustomId("advertise_modal")
-        .setTitle("ServerSpot Advertisement");
-
-      const invite = new TextInputBuilder()
-        .setCustomId("invite")
-        .setLabel("Discord Invite")
-        .setPlaceholder("https://discord.gg/example")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setMaxLength(200);
-
-      const community = new TextInputBuilder()
-        .setCustomId("community")
-        .setLabel("Community / Website Link")
-        .setPlaceholder("https://example.com")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(false)
-        .setMaxLength(500);
-
-      const description = new TextInputBuilder()
-        .setCustomId("description")
-        .setLabel("Server Description")
-        .setPlaceholder("Tell people what makes your server special.")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(true)
-        .setMaxLength(1000);
-
-      const category = new TextInputBuilder()
-        .setCustomId("category")
-        .setLabel("Server Category")
-        .setPlaceholder("Gaming, Community, Education, Social...")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setMaxLength(100);
-
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(invite),
-        new ActionRowBuilder().addComponents(community),
-        new ActionRowBuilder().addComponents(description),
-        new ActionRowBuilder().addComponents(category)
-      );
-
-      return interaction.showModal(modal);
-    }
-
-    /* FEATURED */
-
-    if (command === "featured") {
-      const featured = Object.values(db.advertisements)
-        .filter(ad => ad.status === "accepted")
-        .slice(-1)[0];
-
-      if (!featured) {
-        return safeReply(interaction, {
-          embeds: [
-            baseEmbed(
-              "Featured Servers",
-              "There are currently no featured servers."
-            )
-          ]
-        });
-      }
-
-      return safeReply(interaction, {
-        embeds: [advertisementEmbed(featured, "Online")],
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setLabel("Join Server")
-              .setStyle(ButtonStyle.Link)
-              .setURL(featured.inviteUrl)
-          )
-        ]
-      });
-    }
-
-    /* SERVERS */
-
-    if (command === "servers") {
-      const approved = Object.values(db.advertisements)
-        .filter(ad => ad.status === "accepted")
-        .slice(-10)
-        .reverse();
-
-      if (!approved.length) {
-        return safeReply(interaction, {
-          content: "There are currently no approved servers.",
-          ephemeral: true
-        });
-      }
-
-      const description = approved
-        .map(ad =>
-          `**${ad.serverName}** — ${formatNumber(ad.members)} members\n` +
-          `ID: \`${ad.id}\` • Category: ${ad.category}`
-        )
-        .join("\n\n");
-
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed(
-            "ServerSpot Servers",
-            truncate(description, 4000)
-          )
-        ]
-      });
-    }
-
-    /* SEARCH */
-
-    if (command === "search") {
-      const query = interaction.options
-        .getString("query")
-        .toLowerCase();
-
-      const results = Object.values(db.advertisements)
-        .filter(ad =>
-          ad.status === "accepted" &&
-          (
-            ad.serverName.toLowerCase().includes(query) ||
-            ad.category.toLowerCase().includes(query) ||
-            ad.description.toLowerCase().includes(query)
-          )
-        )
-        .slice(0, 10);
-
-      if (!results.length) {
-        return safeReply(interaction, {
-          content: "No matching servers were found.",
-          ephemeral: true
-        });
-      }
-
-      const description = results
-        .map(ad =>
-          `**${ad.serverName}**\n` +
-          `${truncate(ad.description, 150)}\n` +
-          `Members: **${formatNumber(ad.members)}** • Category: **${ad.category}** • \`${ad.id}\``
-        )
-        .join("\n\n");
-
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed(
-            `Search Results: ${query}`,
-            description
-          )
-        ]
-      });
-    }
-
-    /* RANDOM */
-
-    if (command === "random") {
-      const servers = Object.values(db.advertisements)
-        .filter(ad => ad.status === "accepted");
-
-      if (!servers.length) {
-        return safeReply(interaction, {
-          content: "There are no approved servers yet.",
-          ephemeral: true
-        });
-      }
-
-      const ad = servers[Math.floor(Math.random() * servers.length)];
-
-      return safeReply(interaction, {
-        embeds: [advertisementEmbed(ad, "Online")],
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setLabel("Join Server")
-              .setStyle(ButtonStyle.Link)
-              .setURL(ad.inviteUrl)
-          )
-        ]
-      });
-    }
-
-    /* SERVER INFO */
-
-    if (command === "serverinfo") {
-      const id = interaction.options.getString("id").toUpperCase();
-      const ad = db.advertisements[id];
-
-      if (!ad) {
-        return safeReply(interaction, {
-          content: "No ServerSpot advertisement was found with that ID.",
-          ephemeral: true
-        });
-      }
-
-      return safeReply(interaction, {
-        embeds: [
-          advertisementEmbed(
-            ad,
-            ad.status === "accepted" ? "Online" : ad.status
-          )
-        ]
-      });
-    }
-
-    /* CATEGORIES */
-
-    if (command === "categories") {
-      const categories = {};
-
-      Object.values(db.advertisements)
-        .filter(ad => ad.status === "accepted")
-        .forEach(ad => {
-          categories[ad.category] =
-            (categories[ad.category] || 0) + 1;
-        });
-
-      const text = Object.entries(categories)
-        .map(([name, count]) => `**${name}** — ${count} server(s)`)
-        .join("\n");
-
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed(
-            "ServerSpot Categories",
-            text || "No categories are available yet."
-          )
-        ]
-      });
-    }
-
-    /* MY ADS */
-
-    if (command === "myadvertisements") {
-      const ads = Object.values(db.advertisements)
-        .filter(ad => ad.userId === interaction.user.id)
-        .slice(-10)
-        .reverse();
-
-      if (!ads.length) {
-        return safeReply(interaction, {
-          content: "You haven't submitted any advertisements yet.",
-          ephemeral: true
-        });
-      }
-
-      const text = ads
-        .map(ad =>
-          `**${ad.serverName}** — \`${ad.id}\`\nStatus: **${ad.status}**`
-        )
-        .join("\n\n");
-
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed("Your Advertisements", text)
-        ],
-        ephemeral: true
-      });
-    }
-
-    /* PROFILE */
-
-    if (command === "profile") {
-      const user = ensureUser(interaction.user.id);
-
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed(
-            `${interaction.user.username}'s ServerSpot Profile`,
-            `**Advertisements Submitted:** ${user.submitted}\n` +
-            `**Accepted:** ${user.accepted}\n` +
-            `**Declined:** ${user.declined}\n` +
-            `**Reports:** ${user.reports}`
-          )
-        ]
-      });
-    }
-
-    /* REPORT */
-
-    if (command === "report") {
-      const id = interaction.options.getString("id").toUpperCase();
-      const ad = db.advertisements[id];
-
-      if (!ad) {
-        return safeReply(interaction, {
-          content: "That advertisement could not be found.",
-          ephemeral: true
-        });
-      }
-
-      ensureUser(interaction.user.id).reports++;
-
-      const config = getGuildConfig(interaction.guild.id);
-      const channelId = config.reportChannel || config.logsChannel;
-      const channel = channelId
-        ? interaction.guild.channels.cache.get(channelId)
-        : null;
-
-      if (channel) {
-        await channel.send({
-          embeds: [
-            baseEmbed(
-              "New Server Report",
-              `A user has reported advertisement **${id}**.`
-            ).addFields(
-              {
-                name: "Server",
-                value: ad.serverName,
-                inline: true
-              },
-              {
-                name: "Reported By",
-                value: `<@${interaction.user.id}>`,
-                inline: true
-              },
-              {
-                name: "Advertisement ID",
-                value: id,
-                inline: true
-              }
-            )
-          ]
-        });
-      }
-
-      saveData();
-
-      return safeReply(interaction, {
-        content: "Your report has been sent to ServerSpot staff.",
-        ephemeral: true
-      });
-    }
-
-    /* SUGGEST */
-
-    if (command === "suggest") {
-      const suggestion =
-        interaction.options.getString("suggestion");
-
-      const config = getGuildConfig(interaction.guild.id);
-
-      const channelId =
-        config.suggestionChannel || config.logsChannel;
-
-      const channel = channelId
-        ? interaction.guild.channels.cache.get(channelId)
-        : null;
-
-      if (channel) {
-        await channel.send({
-          embeds: [
-            baseEmbed(
-              "New ServerSpot Suggestion",
-              suggestion
-            ).addFields({
-              name: "Submitted By",
-              value: `<@${interaction.user.id}>`
-            })
-          ]
-        });
-      }
-
-      return safeReply(interaction, {
-        content: "Your suggestion has been submitted.",
-        ephemeral: true
-      });
-    }
-
-    /* PING */
-
-    if (command === "ping") {
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed(
-            "ServerSpot Ping",
-            `Bot latency: **${client.ws.ping}ms**`
-          )
-        ]
-      });
-    }
-
-    /* ABOUT */
-
-    if (command === "about") {
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed(
-            "About ServerSpot",
-            "ServerSpot helps people **discover, advertise and connect** with Discord communities.\n\n" +
-            "Server owners can submit their communities for review while users can discover approved and featured servers."
-          )
-        ]
-      });
-    }
-
-    /* HELP */
-
-    if (command === "help") {
-      const embed = baseEmbed(
-        "ServerSpot Help",
-        "Discover and advertise Discord communities."
-      )
-        .addFields(
-          {
-            name: "User Commands",
-            value:
-              "`/advertise`\n" +
-              "`/featured`\n" +
-              "`/servers`\n" +
-              "`/search`\n" +
-              "`/random`\n" +
-              "`/serverinfo`\n" +
-              "`/categories`\n" +
-              "`/myadvertisements`\n" +
-              "`/profile`\n" +
-              "`/report`\n" +
-              "`/suggest`\n" +
-              "`/stats`\n" +
-              "`/ping`\n" +
-              "`/about`"
-          },
-          {
-            name: "Staff Commands",
-            value:
-              "`/setup`\n" +
-              "`/config`\n" +
-              "`/feature`\n" +
-              "`/unfeature`\n" +
-              "`/blacklist`\n" +
-              "`/unblacklist`"
-          }
-        );
-
-      return safeReply(interaction, { embeds: [embed] });
-    }
-
-    /* STATS */
-
-    if (command === "stats") {
-      const all = Object.values(db.advertisements);
-
-      const accepted =
-        all.filter(ad => ad.status === "accepted").length;
-
-      const pending =
-        all.filter(ad => ad.status === "pending").length;
-
-      const declined =
-        all.filter(ad => ad.status === "declined").length;
-
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed(
-            "ServerSpot Statistics",
-            `**Servers Listed:** ${accepted}\n` +
-            `**Pending Advertisements:** ${pending}\n` +
-            `**Declined Advertisements:** ${declined}\n` +
-            `**Blacklisted Servers:** ${db.blacklist.length}\n` +
-            `**Discord Servers:** ${client.guilds.cache.size}`
-          )
-        ]
-      });
-    }
-
-    /* SETUP */
-
-    if (command === "setup") {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
-        return safeReply(interaction, {
-          content: "You need Administrator permission to use this command.",
-          ephemeral: true
-        });
-      }
-
-      const config = getGuildConfig(interaction.guild.id);
-
-      config.logsChannel =
-        interaction.options.getChannel("logs").id;
-
-      config.featuredChannel =
-        interaction.options.getChannel("featured").id;
-
-      config.staffRole =
-        interaction.options.getRole("staff").id;
-
-      const reports =
-        interaction.options.getChannel("reports");
-
-      const suggestions =
-        interaction.options.getChannel("suggestions");
-
-      config.reportChannel =
-        reports ? reports.id : config.logsChannel;
-
-      config.suggestionChannel =
-        suggestions ? suggestions.id : config.logsChannel;
-
-      saveData();
-
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed(
-            "ServerSpot Configured",
-            "ServerSpot has been configured successfully."
-          ).addFields(
-            {
-              name: "Advertisement Logs",
-              value: `<#${config.logsChannel}>`
-            },
-            {
-              name: "Featured Servers",
-              value: `<#${config.featuredChannel}>`
-            },
-            {
-              name: "Staff Role",
-              value: `<@&${config.staffRole}>`
-            }
-          )
-        ]
-      });
-    }
-
-    /* CONFIG */
-
-    if (command === "config") {
-      if (!isStaff(interaction)) {
-        return safeReply(interaction, {
-          content: "You do not have permission to view the configuration.",
-          ephemeral: true
-        });
-      }
-
-      const config = getGuildConfig(interaction.guild.id);
-
-      return safeReply(interaction, {
-        embeds: [
-          baseEmbed(
-            "ServerSpot Configuration",
-            "Current ServerSpot settings."
-          ).addFields(
-            {
-              name: "Advertisement Logs",
-              value: config.logsChannel
-                ? `<#${config.logsChannel}>`
-                : "Not configured",
-              inline: true
-            },
-            {
-              name: "Featured Channel",
-              value: config.featuredChannel
-                ? `<#${config.featuredChannel}>`
-                : "Not configured",
-              inline: true
-            },
-            {
-              name: "Staff Role",
-              value: config.staffRole
-                ? `<@&${config.staffRole}>`
-                : "Not configured",
-              inline: true
-            },
-            {
-              name: "Reports",
-              value: config.reportChannel
-                ? `<#${config.reportChannel}>`
-                : "Not configured",
-              inline: true
-            },
-            {
-              name: "Suggestions",
-              value: config.suggestionChannel
-                ? `<#${config.suggestionChannel}>`
-                : "Not configured",
-              inline: true
-            }
-          )
-        ],
-        ephemeral: true
-      });
-    }
-
-    /* FEATURE */
-
-    if (command === "feature") {
-      const id = interaction.options.getString("id").toUpperCase();
-      const ad = db.advertisements[id];
-
-      if (!ad || ad.status !== "accepted") {
-        return safeReply(interaction, {
-          content: "That advertisement is not approved.",
-          ephemeral: true
-        });
-      }
-
-      const config = getGuildConfig(interaction.guild.id);
-
-      const channel = config.featuredChannel
-        ? interaction.guild.channels.cache.get(config.featuredChannel)
-        : null;
-
-      if (!channel) {
-        return safeReply(interaction, {
-          content: "The Featured Servers channel has not been configured.",
-          ephemeral: true
-        });
-      }
-
-      await channel.send({
-        embeds: [advertisementEmbed(ad, "Online")],
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setLabel("Join Server")
-              .setStyle(ButtonStyle.Link)
-              .setURL(ad.inviteUrl)
-          )
-        ]
-      });
-
-      return safeReply(interaction, {
-        content: `**${id}** has been featured.`,
-        ephemeral: true
-      });
-    }
-
-    /* UNFEATURE */
-
-    if (command === "unfeature") {
-      const id = interaction.options.getString("id").toUpperCase();
-
-      return safeReply(interaction, {
-        content:
-          `Advertisement **${id}** has been marked for removal. ` +
-          `Remove its existing post from the Featured Servers channel if necessary.`,
-        ephemeral: true
-      });
-    }
-
-    /* BLACKLIST */
-
-    if (command === "blacklist") {
-      const invite = cleanInvite(
-        interaction.options.getString("invite")
-      );
-
-      if (!db.blacklist.includes(invite)) {
-        db.blacklist.push(invite);
-        saveData();
-      }
-
-      return safeReply(interaction, {
-        content: `The invite **${invite}** has been blacklisted.`,
-        ephemeral: true
-      });
-    }
-
-    /* UNBLACKLIST */
-
-    if (command === "unblacklist") {
-      const invite = cleanInvite(
-        interaction.options.getString("invite")
-      );
-
-      db.blacklist =
-        db.blacklist.filter(item => item !== invite);
-
-      saveData();
-
-      return safeReply(interaction, {
-        content: `The invite **${invite}** has been removed from the blacklist.`,
-        ephemeral: true
-      });
-    }
-
-  } catch (error) {
-    console.error("Interaction error:", error);
-
-    try {
-      await safeReply(interaction, {
-        content:
-          "Something went wrong while processing that request. Please try again.",
-        ephemeral: true
-      });
-    } catch {}
-  }
 });
 
-/* ---------------- ADVERTISEMENT MODAL ---------------- */
+// ======================================================
+// INTERACTION HANDLER
+// ======================================================
 
 client.on("interactionCreate", async interaction => {
-  if (!interaction.isModalSubmit()) return;
-  if (interaction.customId !== "advertise_modal") return;
-
-  try {
-    await interaction.deferReply({ ephemeral: true });
-
-    const inviteInput =
-      interaction.fields.getTextInputValue("invite");
-
-    const communityLink =
-      interaction.fields.getTextInputValue("community") || null;
-
-    const description =
-      interaction.fields.getTextInputValue("description");
-
-    const category =
-      interaction.fields.getTextInputValue("category");
-
-    if (!validInvite(inviteInput)) {
-      return interaction.editReply({
-        content:
-          "That does not look like a valid Discord invite."
-      });
-    }
-
-    const inviteCode = cleanInvite(inviteInput);
-
-    if (db.blacklist.includes(inviteCode)) {
-      return interaction.editReply({
-        content:
-          "This server is currently blacklisted from ServerSpot."
-      });
-    }
-
-    const existing = Object.values(db.advertisements)
-      .find(ad =>
-        ad.inviteCode === inviteCode &&
-        ["pending", "accepted"].includes(ad.status)
-      );
-
-    if (existing) {
-      return interaction.editReply({
-        content:
-          `This server already has an active advertisement: **${existing.id}**`
-      });
-    }
-
-    let inviteData;
 
     try {
-      inviteData = await lookupInvite(inviteCode);
-    } catch {
-      return interaction.editReply({
-        content:
-          "I couldn't verify that Discord invite. Please make sure it is valid and active."
-      });
+
+        // ==================================================
+        // SLASH COMMANDS
+        // ==================================================
+
+        if (interaction.isChatInputCommand()) {
+
+            // ----------------------------------------------
+            // /PING
+            // ----------------------------------------------
+
+            if (interaction.commandName === "ping") {
+
+                const latency = Date.now() - interaction.createdTimestamp;
+
+                return interaction.reply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(COLOUR)
+                            .setTitle("ServerSpot")
+                            .setDescription(
+                                `ServerSpot is online and responding normally.\n\n` +
+                                `**Response Time**\n${latency}ms`
+                            )
+                            .setFooter({
+                                text: "ServerSpot"
+                            })
+                    ],
+                    ephemeral: true
+                });
+            }
+
+            // ----------------------------------------------
+            // /SERVERINFO
+            // ----------------------------------------------
+
+            if (interaction.commandName === "serverinfo") {
+
+                const guild = interaction.guild;
+
+                return interaction.reply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(COLOUR)
+                            .setTitle("ServerSpot")
+                            .setDescription(
+                                "ServerSpot helps Discord communities discover, advertise and connect with new servers."
+                            )
+                            .addFields(
+                                {
+                                    name: "Servers",
+                                    value: `${client.guilds.cache.size}`,
+                                    inline: true
+                                },
+                                {
+                                    name: "Members",
+                                    value: `${client.guilds.cache.reduce(
+                                        (total, g) => total + (g.memberCount || 0),
+                                        0
+                                    )}`,
+                                    inline: true
+                                },
+                                {
+                                    name: "Current Server",
+                                    value: guild.name,
+                                    inline: true
+                                }
+                            )
+                            .setFooter({
+                                text: "ServerSpot • Discover. Advertise. Connect."
+                            })
+                    ],
+                    ephemeral: true
+                });
+            }
+
+            // ----------------------------------------------
+            // /SETUP
+            // ----------------------------------------------
+
+            if (interaction.commandName === "setup") {
+
+                if (!interaction.memberPermissions.has(
+                    PermissionFlagsBits.Administrator
+                )) {
+                    return interaction.reply({
+                        content: "You need Administrator permissions to use this command.",
+                        ephemeral: true
+                    });
+                }
+
+                const logs = interaction.options.getChannel("logs");
+                const featured = interaction.options.getChannel("featured");
+                const staff = interaction.options.getRole("staff");
+
+                configurations[interaction.guild.id] = {
+                    logsChannel: logs.id,
+                    featuredChannel: featured.id,
+                    staffRole: staff.id
+                };
+
+                saveConfigurations();
+
+                return interaction.reply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(COLOUR)
+                            .setTitle("ServerSpot Setup Complete")
+                            .setDescription(
+                                "ServerSpot has been configured successfully."
+                            )
+                            .addFields(
+                                {
+                                    name: "Advertisement Logs",
+                                    value: `${logs}`,
+                                    inline: true
+                                },
+                                {
+                                    name: "Featured Servers",
+                                    value: `${featured}`,
+                                    inline: true
+                                },
+                                {
+                                    name: "Staff Role",
+                                    value: `${staff}`,
+                                    inline: true
+                                }
+                            )
+                            .setFooter({
+                                text: "ServerSpot configuration"
+                            })
+                    ],
+                    ephemeral: true
+                });
+            }
+
+            // ----------------------------------------------
+            // /CONFIG
+            // ----------------------------------------------
+
+            if (interaction.commandName === "config") {
+
+                const config = getConfig(interaction.guild.id);
+
+                if (!config.logsChannel ||
+                    !config.featuredChannel ||
+                    !config.staffRole) {
+
+                    return interaction.reply({
+                        content:
+                            "ServerSpot has not been configured yet. Use `/setup` first.",
+                        ephemeral: true
+                    });
+                }
+
+                return interaction.reply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(COLOUR)
+                            .setTitle("ServerSpot Configuration")
+                            .addFields(
+                                {
+                                    name: "Advertisement Logs",
+                                    value: `<#${config.logsChannel}>`,
+                                    inline: true
+                                },
+                                {
+                                    name: "Featured Servers",
+                                    value: `<#${config.featuredChannel}>`,
+                                    inline: true
+                                },
+                                {
+                                    name: "Staff Role",
+                                    value: `<@&${config.staffRole}>`,
+                                    inline: true
+                                }
+                            )
+                    ],
+                    ephemeral: true
+                });
+            }
+
+            // ----------------------------------------------
+            // /ADVERTISE
+            // ----------------------------------------------
+
+            if (interaction.commandName === "advertise") {
+
+                const config = getConfig(interaction.guild.id);
+
+                if (!config.logsChannel ||
+                    !config.featuredChannel ||
+                    !config.staffRole) {
+
+                    return interaction.reply({
+                        content:
+                            "ServerSpot has not been configured yet. Please ask a server administrator to run `/setup`.",
+                        ephemeral: true
+                    });
+                }
+
+                const modal = new ModalBuilder()
+                    .setCustomId("serverspot_advertise")
+                    .setTitle("Submit a Server Advertisement");
+
+                const inviteInput = new TextInputBuilder()
+                    .setCustomId("invite")
+                    .setLabel("Discord Invite Link")
+                    .setPlaceholder("https://discord.gg/example")
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true)
+                    .setMaxLength(200);
+
+                const groupInput = new TextInputBuilder()
+                    .setCustomId("group")
+                    .setLabel("Server / Group Link")
+                    .setPlaceholder("Enter your server or group link")
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true)
+                    .setMaxLength(300);
+
+                const imageInput = new TextInputBuilder()
+                    .setCustomId("image")
+                    .setLabel("Server Image URL")
+                    .setPlaceholder("https://example.com/server-image.png")
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(false)
+                    .setMaxLength(500);
+
+                const descriptionInput = new TextInputBuilder()
+                    .setCustomId("description")
+                    .setLabel("Server Description")
+                    .setPlaceholder("Tell people what your server is about...")
+                    .setStyle(TextInputStyle.Paragraph)
+                    .setRequired(true)
+                    .setMaxLength(1000);
+
+                const statusInput = new TextInputBuilder()
+                    .setCustomId("status")
+                    .setLabel("Server Status")
+                    .setPlaceholder("Open • Active • Recruiting • etc.")
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true)
+                    .setMaxLength(100);
+
+                modal.addComponents(
+                    new ActionRowBuilder().addComponents(inviteInput),
+                    new ActionRowBuilder().addComponents(groupInput),
+                    new ActionRowBuilder().addComponents(imageInput),
+                    new ActionRowBuilder().addComponents(descriptionInput),
+                    new ActionRowBuilder().addComponents(statusInput)
+                );
+
+                return interaction.showModal(modal);
+            }
+        }
+
+        // ==================================================
+        // ADVERTISEMENT FORM
+        // ==================================================
+
+        if (
+            interaction.isModalSubmit() &&
+            interaction.customId === "serverspot_advertise"
+        ) {
+
+            // IMPORTANT:
+            // A modal must be acknowledged immediately.
+            // This prevents "Unknown interaction" errors.
+
+            await interaction.deferReply({
+                ephemeral: true
+            });
+
+            const config = getConfig(interaction.guild.id);
+
+            if (!config.logsChannel ||
+                !config.featuredChannel ||
+                !config.staffRole) {
+
+                return interaction.editReply(
+                    "ServerSpot has not been configured yet. Please ask an administrator to run `/setup`."
+                );
+            }
+
+            const invite = interaction.fields.getTextInputValue("invite");
+            const group = interaction.fields.getTextInputValue("group");
+            const image = interaction.fields.getTextInputValue("image");
+            const description =
+                interaction.fields.getTextInputValue("description");
+            const status =
+                interaction.fields.getTextInputValue("status");
+
+            // ----------------------------------------------
+            // BASIC LINK VALIDATION
+            // ----------------------------------------------
+
+            if (
+                !invite.includes("discord.gg/") &&
+                !invite.includes("discord.com/invite/")
+            ) {
+
+                return interaction.editReply(
+                    "That doesn't look like a valid Discord invite link."
+                );
+            }
+
+            // ----------------------------------------------
+            // TRY TO GET SERVER INFORMATION
+            // ----------------------------------------------
+
+            let inviteInfo = null;
+            let serverName = "Unknown Server";
+            let memberCount = "Unknown";
+            let serverIcon = image || null;
+
+            try {
+
+                inviteInfo = await client.fetchInvite(invite, {
+                    withCounts: true
+                });
+
+                if (inviteInfo.guild) {
+
+                    serverName =
+                        inviteInfo.guild.name ||
+                        "Unknown Server";
+
+                    if (inviteInfo.approximateMemberCount) {
+                        memberCount =
+                            inviteInfo.approximateMemberCount
+                                .toLocaleString();
+                    }
+
+                    if (!serverIcon && inviteInfo.guild.icon) {
+                        serverIcon =
+                            `https://cdn.discordapp.com/icons/${inviteInfo.guild.id}/${inviteInfo.guild.icon}.png?size=512`;
+                    }
+                }
+
+            } catch (error) {
+
+                console.log(
+                    "Could not fetch invite information:",
+                    error.message
+                );
+            }
+
+            // ----------------------------------------------
+            // ADVERTISEMENT ID
+            // ----------------------------------------------
+
+            const advertisementId =
+                `${Date.now()}-${interaction.user.id}`;
+
+            // ----------------------------------------------
+            // LOG EMBED
+            // ----------------------------------------------
+
+            const logEmbed = new EmbedBuilder()
+                .setColor(COLOUR)
+                .setTitle("New Server Advertisement")
+                .setDescription(
+                    `A new advertisement has been submitted for review.`
+                )
+                .addFields(
+                    {
+                        name: "Server",
+                        value: serverName,
+                        inline: true
+                    },
+                    {
+                        name: "Submitted By",
+                        value: `${interaction.user}`,
+                        inline: true
+                    },
+                    {
+                        name: "Members",
+                        value: memberCount.toString(),
+                        inline: true
+                    },
+                    {
+                        name: "Status",
+                        value: status,
+                        inline: true
+                    },
+                    {
+                        name: "Discord Invite",
+                        value: invite,
+                        inline: false
+                    },
+                    {
+                        name: "Group Link",
+                        value: group,
+                        inline: false
+                    },
+                    {
+                        name: "Description",
+                        value: description,
+                        inline: false
+                    },
+                    {
+                        name: "Advertisement ID",
+                        value: advertisementId,
+                        inline: false
+                    }
+                )
+                .setFooter({
+                    text: "ServerSpot • Awaiting staff review"
+                })
+                .setTimestamp();
+
+            if (serverIcon) {
+                logEmbed.setThumbnail(serverIcon);
+            }
+
+            const buttons = new ActionRowBuilder()
+                .addComponents(
+
+                    new ButtonBuilder()
+                        .setCustomId(
+                            `serverspot_accept:${advertisementId}`
+                        )
+                        .setLabel("Accept")
+                        .setStyle(ButtonStyle.Success),
+
+                    new ButtonBuilder()
+                        .setCustomId(
+                            `serverspot_decline:${advertisementId}`
+                        )
+                        .setLabel("Decline")
+                        .setStyle(ButtonStyle.Danger)
+
+                );
+
+            const logsChannel =
+                interaction.guild.channels.cache.get(
+                    config.logsChannel
+                );
+
+            if (!logsChannel) {
+
+                return interaction.editReply(
+                    "The configured advertisement logs channel could not be found."
+                );
+            }
+
+            const logMessage = await logsChannel.send({
+                embeds: [logEmbed],
+                components: [buttons]
+            });
+
+            // Store temporary information on the message itself
+            // so the staff buttons know who submitted it.
+
+            logMessage.advertisementData = {
+                userId: interaction.user.id,
+                invite,
+                group,
+                image: serverIcon,
+                description,
+                status,
+                serverName,
+                memberCount
+            };
+
+            return interaction.editReply(
+                "Your advertisement has been submitted successfully and is now awaiting staff review."
+            );
+        }
+
+        // ==================================================
+        // ACCEPT ADVERTISEMENT
+        // ==================================================
+
+        if (
+            interaction.isButton() &&
+            interaction.customId.startsWith(
+                "serverspot_accept:"
+            )
+        ) {
+
+            const config = getConfig(interaction.guild.id);
+
+            if (!config.staffRole) {
+                return interaction.reply({
+                    content:
+                        "ServerSpot has not been configured correctly.",
+                    ephemeral: true
+                });
+            }
+
+            if (
+                !interaction.member.roles.cache.has(
+                    config.staffRole
+                ) &&
+                !interaction.memberPermissions.has(
+                    PermissionFlagsBits.Administrator
+                )
+            ) {
+
+                return interaction.reply({
+                    content:
+                        "You do not have permission to review advertisements.",
+                    ephemeral: true
+                });
+            }
+
+            await interaction.deferUpdate();
+
+            const originalEmbed =
+                interaction.message.embeds[0];
+
+            const fields =
+                originalEmbed?.fields || [];
+
+            function getField(name) {
+
+                const field = fields.find(
+                    field => field.name === name
+                );
+
+                return field ? field.value : "";
+            }
+
+            const serverName =
+                getField("Server") || "Unknown Server";
+
+            const submitter =
+                getField("Submitted By");
+
+            const members =
+                getField("Members") || "Unknown";
+
+            const status =
+                getField("Status") || "Unknown";
+
+            const invite =
+                getField("Discord Invite");
+
+            const group =
+                getField("Group Link");
+
+            const description =
+                getField("Description");
+
+            // ----------------------------------------------
+            // GET FEATURED CHANNEL
+            // ----------------------------------------------
+
+            const featuredChannel =
+                interaction.guild.channels.cache.get(
+                    config.featuredChannel
+                );
+
+            if (!featuredChannel) {
+
+                return interaction.followUp({
+                    content:
+                        "The configured Featured Servers channel could not be found.",
+                    ephemeral: true
+                });
+            }
+
+            // ----------------------------------------------
+            // FEATURED EMBED
+            // ----------------------------------------------
+
+            const featuredEmbed = new EmbedBuilder()
+                .setColor(COLOUR)
+                .setTitle(serverName)
+                .setDescription(description || "No description provided.")
+                .addFields(
+                    {
+                        name: "Status",
+                        value: status,
+                        inline: true
+                    },
+                    {
+                        name: "Members",
+                        value: members.toString(),
+                        inline: true
+                    },
+                    {
+                        name: "Advertised By",
+                        value: submitter || "Unknown",
+                        inline: true
+                    }
+                )
+                .addFields(
+                    {
+                        name: "Discord",
+                        value: `[Join Server](${invite})`,
+                        inline: true
+                    },
+                    {
+                        name: "Group",
+                        value: `[View Group](${group})`,
+                        inline: true
+                    }
+                )
+                .setFooter({
+                    text: "ServerSpot • Featured Server"
+                })
+                .setTimestamp();
+
+            // Use the submitted server image as the thumbnail.
+
+            const thumbnail =
+                originalEmbed?.thumbnail?.url;
+
+            if (thumbnail) {
+                featuredEmbed.setThumbnail(thumbnail);
+            }
+
+            await featuredChannel.send({
+                embeds: [featuredEmbed]
+            });
+
+            // ----------------------------------------------
+            // UPDATE LOG MESSAGE
+            // ----------------------------------------------
+
+            const acceptedEmbed =
+                EmbedBuilder.from(originalEmbed)
+                    .setColor(0x22C55E)
+                    .setFooter({
+                        text:
+                            `Accepted by ${interaction.user.tag}`
+                    });
+
+            await interaction.message.edit({
+                embeds: [acceptedEmbed],
+                components: []
+            });
+
+            // ----------------------------------------------
+            // DM SUBMITTER
+            // ----------------------------------------------
+
+            const userId =
+                getField("Submitted By")
+                    .replace(/[<@!>]/g, "");
+
+            try {
+
+                const user =
+                    await client.users.fetch(userId);
+
+                await user.send({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(0x22C55E)
+                            .setTitle("Advertisement Approved")
+                            .setDescription(
+                                `Your ServerSpot advertisement for **${serverName}** has been approved and added to the Featured Servers channel.`
+                            )
+                    ]
+                });
+
+            } catch {
+                console.log(
+                    "Could not DM advertisement submitter."
+                );
+            }
+
+            return;
+        }
+
+        // ==================================================
+        // DECLINE ADVERTISEMENT
+        // ==================================================
+
+        if (
+            interaction.isButton() &&
+            interaction.customId.startsWith(
+                "serverspot_decline:"
+            )
+        ) {
+
+            const config = getConfig(interaction.guild.id);
+
+            if (!config.staffRole) {
+                return interaction.reply({
+                    content:
+                        "ServerSpot has not been configured correctly.",
+                    ephemeral: true
+                });
+            }
+
+            if (
+                !interaction.member.roles.cache.has(
+                    config.staffRole
+                ) &&
+                !interaction.memberPermissions.has(
+                    PermissionFlagsBits.Administrator
+                )
+            ) {
+
+                return interaction.reply({
+                    content:
+                        "You do not have permission to review advertisements.",
+                    ephemeral: true
+                });
+            }
+
+            await interaction.deferUpdate();
+
+            const originalEmbed =
+                interaction.message.embeds[0];
+
+            const fields =
+                originalEmbed?.fields || [];
+
+            function getField(name) {
+
+                const field = fields.find(
+                    field => field.name === name
+                );
+
+                return field ? field.value : "";
+            }
+
+            const serverName =
+                getField("Server") || "Unknown Server";
+
+            const submitter =
+                getField("Submitted By");
+
+            const userId =
+                submitter.replace(/[<@!>]/g, "");
+
+            const declinedEmbed =
+                EmbedBuilder.from(originalEmbed)
+                    .setColor(0x555555)
+                    .setFooter({
+                        text:
+                            `Declined by ${interaction.user.tag}`
+                    });
+
+            await interaction.message.edit({
+                embeds: [declinedEmbed],
+                components: []
+            });
+
+            // ----------------------------------------------
+            // DM USER
+            // ----------------------------------------------
+
+            try {
+
+                const user =
+                    await client.users.fetch(userId);
+
+                await user.send({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(COLOUR)
+                            .setTitle("Advertisement Declined")
+                            .setDescription(
+                                `Your ServerSpot advertisement for **${serverName}** was not approved by our moderation team.\n\nYou may correct your advertisement and submit it again using \`/advertise\`.`
+                            )
+                            .setFooter({
+                                text: "ServerSpot"
+                            })
+                    ]
+                });
+
+            } catch {
+                console.log(
+                    "Could not DM declined advertisement submitter."
+                );
+            }
+
+            return;
+        }
+
+    } catch (error) {
+
+        console.error(
+            "Interaction error:",
+            error
+        );
+
+        // Prevent the bot from crashing if Discord has
+        // already received the interaction response.
+
+        try {
+
+            if (interaction.deferred) {
+
+                await interaction.editReply({
+                    content:
+                        "Something went wrong while processing that request."
+                });
+
+            } else if (!interaction.replied) {
+
+                await interaction.reply({
+                    content:
+                        "Something went wrong while processing that request.",
+                    ephemeral: true
+                });
+
+            }
+
+        } catch {
+            // Interaction already expired or was acknowledged.
+        }
     }
-
-    if (!inviteData.guild) {
-      return interaction.editReply({
-        content:
-          "That invite does not provide enough server information for ServerSpot."
-      });
-    }
-
-    const serverName =
-      inviteData.guild.name || "Unknown Server";
-
-    const members =
-      inviteData.approximate_member_count || 0;
-
-    const iconHash =
-      inviteData.guild.icon;
-
-    const icon = iconHash
-      ? `https://cdn.discordapp.com/icons/${inviteData.guild.id}/${iconHash}.png?size=256`
-      : null;
-
-    const id = makeId();
-
-    const ad = {
-      id,
-      guildId: interaction.guild.id,
-      userId: interaction.user.id,
-      serverId: inviteData.guild.id,
-      serverName,
-      inviteCode,
-      inviteUrl: `https://discord.gg/${inviteCode}`,
-      communityLink,
-      description,
-      category,
-      members,
-      icon,
-      status: "pending",
-      createdAt: Date.now(),
-      reviewedBy: null,
-      reviewedAt: null,
-      reason: null,
-      reviewMessageId: null
-    };
-
-    db.advertisements[id] = ad;
-
-    const user = ensureUser(interaction.user.id);
-    user.submitted++;
-
-    saveData();
-
-    const config = getGuildConfig(interaction.guild.id);
-
-    if (!config.logsChannel) {
-      delete db.advertisements[id];
-      user.submitted--;
-      saveData();
-
-      return interaction.editReply({
-        content:
-          "ServerSpot has not been configured yet. An administrator needs to run `/setup` first."
-      });
-    }
-
-    const logs = interaction.guild.channels.cache.get(
-      config.logsChannel
-    );
-
-    if (!logs) {
-      return interaction.editReply({
-        content:
-          "The configured advertisement logs channel could not be found."
-      });
-    }
-
-    const message = await logs.send({
-      embeds: [
-        advertisementEmbed(ad, "Pending")
-      ],
-      components: [
-        advertisementButtons(id)
-      ]
-    });
-
-    ad.reviewMessageId = message.id;
-
-    saveData();
-
-    return interaction.editReply({
-      content:
-        `Your advertisement has been submitted successfully.\n\n` +
-        `Advertisement ID: **${id}**\n` +
-        `Server: **${serverName}**\n` +
-        `Status: **Pending Review**`
-    });
-
-  } catch (error) {
-    console.error("Advertisement submission error:", error);
-
-    try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply({
-          content:
-            "Something went wrong while submitting your advertisement."
-        });
-      }
-    } catch {}
-  }
 });
 
-/* ---------------- SAFETY ---------------- */
+// ======================================================
+// DISCORD ERROR HANDLING
+// ======================================================
 
 client.on("error", error => {
-  console.error("Discord client error:", error);
+    console.error("Discord client error:", error);
 });
 
 process.on("unhandledRejection", error => {
-  console.error("Unhandled promise rejection:", error);
+    console.error("Unhandled promise rejection:", error);
 });
 
 process.on("uncaughtException", error => {
-  console.error("Uncaught exception:", error);
+    console.error("Uncaught exception:", error);
 });
 
-/* ---------------- START ---------------- */
+// ======================================================
+// LOGIN
+// ======================================================
 
 client.login(TOKEN);
