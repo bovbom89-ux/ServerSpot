@@ -12,26 +12,96 @@ const {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
-    ChannelType
+    ChannelType,
+    MessageFlags
 } = require("discord.js");
 
-const client = new Client({
-    intents: [GatewayIntentBits.Guilds]
-});
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+
+// =====================================================
+// CONFIGURATION
+// =====================================================
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 
 const EMBED_COLOR = 0xE00000;
+const PORT = process.env.PORT || 3000;
+
+if (!TOKEN || !CLIENT_ID) {
+    console.error("Missing DISCORD_TOKEN or CLIENT_ID environment variable.");
+    process.exit(1);
+}
 
 // =====================================================
-// DATA
+// PERSISTENT DATA
 // =====================================================
 
-const advertisements = new Map();
-const guildSettings = new Map();
-const featured = new Set();
-const blacklisted = new Set();
+const DATA_FILE = path.join(__dirname, "serverspot-data.json");
+
+let data = {
+    guilds: {},
+    advertisements: {},
+    featured: [],
+    blacklisted: []
+};
+
+function loadData() {
+    try {
+        if (fs.existsSync(DATA_FILE)) {
+            const file = fs.readFileSync(DATA_FILE, "utf8");
+            data = JSON.parse(file);
+
+            if (!data.guilds) data.guilds = {};
+            if (!data.advertisements) data.advertisements = {};
+            if (!data.featured) data.featured = [];
+            if (!data.blacklisted) data.blacklisted = [];
+        }
+
+        console.log("ServerSpot data loaded.");
+    } catch (error) {
+        console.error("Could not load ServerSpot data:", error);
+    }
+}
+
+function saveData() {
+    try {
+        fs.writeFileSync(
+            DATA_FILE,
+            JSON.stringify(data, null, 2)
+        );
+    } catch (error) {
+        console.error("Could not save ServerSpot data:", error);
+    }
+}
+
+loadData();
+
+// =====================================================
+// DISCORD CLIENT
+// =====================================================
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds
+    ]
+});
+
+// =====================================================
+// HTTP SERVER FOR RENDER
+// =====================================================
+
+http.createServer((req, res) => {
+    res.writeHead(200, {
+        "Content-Type": "text/plain"
+    });
+
+    res.end("ServerSpot is online.");
+}).listen(PORT, "0.0.0.0", () => {
+    console.log(`Web server listening on port ${PORT}`);
+});
 
 // =====================================================
 // COMMANDS
@@ -39,7 +109,7 @@ const blacklisted = new Set();
 
 const commands = [
 
-    // USER COMMANDS
+    // USER
 
     new SlashCommandBuilder()
         .setName("advertise")
@@ -55,7 +125,7 @@ const commands = [
         .addStringOption(option =>
             option
                 .setName("query")
-                .setDescription("What are you looking for?")
+                .setDescription("Search for a server")
                 .setRequired(true)
         ),
 
@@ -89,7 +159,7 @@ const commands = [
         .setName("about")
         .setDescription("Learn about ServerSpot"),
 
-    // STAFF COMMANDS
+    // STAFF
 
     new SlashCommandBuilder()
         .setName("setup")
@@ -135,7 +205,7 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("unfeature")
-        .setDescription("Remove a server from featured")
+        .setDescription("Remove featured status")
         .addStringOption(option =>
             option
                 .setName("name")
@@ -207,7 +277,17 @@ function validURL(value) {
 }
 
 // =====================================================
-// COMMAND REGISTRATION
+// DISCORD INVITE CHECK
+// =====================================================
+
+function validDiscordInvite(value) {
+    return /^https?:\/\/(www\.)?(discord\.gg|discord\.com\/invite)\/.+/i.test(
+        value
+    );
+}
+
+// =====================================================
+// REGISTER COMMANDS
 // =====================================================
 
 async function registerCommands() {
@@ -225,15 +305,9 @@ async function registerCommands() {
             }
         );
 
-        console.log(
-            "ServerSpot commands registered successfully."
-        );
-
+        console.log("ServerSpot commands registered successfully.");
     } catch (error) {
-        console.error(
-            "Command registration failed:",
-            error
-        );
+        console.error("Command registration failed:", error);
     }
 }
 
@@ -241,8 +315,7 @@ async function registerCommands() {
 // READY
 // =====================================================
 
-client.once("ready", async () => {
-
+client.once("clientReady", async () => {
     console.log(
         `ServerSpot is online as ${client.user.tag}`
     );
@@ -252,7 +325,6 @@ client.once("ready", async () => {
     );
 
     await registerCommands();
-
 });
 
 // =====================================================
@@ -269,195 +341,142 @@ client.on("interactionCreate", async interaction => {
 
         if (
             interaction.isButton() &&
-            interaction.customId.startsWith(
-                "serverspot_accept_"
-            )
+            interaction.customId.startsWith("serverspot_accept_")
         ) {
 
             if (!isStaff(interaction)) {
                 return interaction.reply({
-                    content:
-                        "You do not have permission to accept advertisements.",
-                    ephemeral: true
+                    content: "You do not have permission to accept advertisements.",
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
-            const advertisementId =
-                interaction.customId.replace(
-                    "serverspot_accept_",
-                    ""
-                );
-
-            const advertisement =
-                advertisements.get(
-                    advertisementId
-                );
-
-            if (!advertisement) {
-                return interaction.reply({
-                    content:
-                        "This advertisement could not be found. It may have expired or the bot may have restarted.",
-                    ephemeral: true
-                });
-            }
-
-            if (
-                advertisement.status !==
-                "Pending"
-            ) {
-                return interaction.reply({
-                    content:
-                        `This advertisement has already been ${advertisement.status.toLowerCase()}.`,
-                    ephemeral: true
-                });
-            }
-
-            const settings =
-                guildSettings.get(
-                    advertisement.guildId
-                );
-
-            if (!settings) {
-                return interaction.reply({
-                    content:
-                        "ServerSpot has not been configured correctly. Please run `/setup` again.",
-                    ephemeral: true
-                });
-            }
-
-            const channel =
-                await client.channels.fetch(
-                    settings.advertisementChannel
-                ).catch(() => null);
-
-            if (!channel) {
-                return interaction.reply({
-                    content:
-                        "The public advertisement channel could not be found.",
-                    ephemeral: true
-                });
-            }
-
-            // Mark as approved
-            advertisement.status = "Approved";
-
-            advertisement.approvedBy =
-                interaction.user.id;
-
-            // Public advertisement
-            const publicEmbed =
-                new EmbedBuilder()
-                    .setColor(EMBED_COLOR)
-                    .setTitle(
-                        advertisement.name
-                    )
-                    .setDescription(
-                        advertisement.description
-                    )
-                    .addFields(
-                        {
-                            name: "Category",
-                            value:
-                                advertisement.category,
-                            inline: true
-                        },
-                        {
-                            name: "Discord",
-                            value:
-                                `[Join Server](${advertisement.invite})`,
-                            inline: true
-                        },
-                        {
-                            name: "Group",
-                            value:
-                                `[View Group](${advertisement.group})`,
-                            inline: true
-                        }
-                    )
-                    .setFooter({
-                        text:
-                            "ServerSpot • Discover. Advertise. Connect."
-                    })
-                    .setTimestamp();
-
-            await channel.send({
-                embeds: [
-                    publicEmbed
-                ]
+            // Acknowledge immediately
+            await interaction.deferReply({
+                flags: MessageFlags.Ephemeral
             });
 
-            // Update logs message
-            const approvedLog =
-                new EmbedBuilder()
-                    .setColor(EMBED_COLOR)
-                    .setTitle(
-                        "Advertisement Approved"
-                    )
-                    .addFields(
-                        {
-                            name: "Server",
-                            value:
-                                advertisement.name
-                        },
-                        {
-                            name: "Submitted By",
-                            value:
-                                `<@${advertisement.userId}>`
-                        },
-                        {
-                            name: "Approved By",
-                            value:
-                                `<@${interaction.user.id}>`
-                        },
-                        {
-                            name: "Status",
-                            value:
-                                "Approved"
-                        }
-                    )
-                    .setTimestamp();
+            const id = interaction.customId.replace(
+                "serverspot_accept_",
+                ""
+            );
+
+            const ad = data.advertisements[id];
+
+            if (!ad) {
+                return interaction.editReply(
+                    "This advertisement could not be found."
+                );
+            }
+
+            if (ad.status !== "Pending") {
+                return interaction.editReply(
+                    `This advertisement has already been ${ad.status.toLowerCase()}.`
+                );
+            }
+
+            const settings = data.guilds[ad.guildId];
+
+            if (!settings) {
+                return interaction.editReply(
+                    "ServerSpot has not been configured correctly. Please run `/setup` again."
+                );
+            }
+
+            const channel = await client.channels.fetch(
+                settings.advertisementChannel
+            ).catch(() => null);
+
+            if (!channel) {
+                return interaction.editReply(
+                    "The advertisement channel could not be found."
+                );
+            }
+
+            ad.status = "Approved";
+            ad.approvedBy = interaction.user.id;
+            ad.approvedAt = Date.now();
+
+            saveData();
+
+            const publicEmbed = new EmbedBuilder()
+                .setColor(EMBED_COLOR)
+                .setTitle(ad.name)
+                .setDescription(ad.description)
+                .addFields(
+                    {
+                        name: "Category",
+                        value: ad.category,
+                        inline: true
+                    },
+                    {
+                        name: "Discord",
+                        value: `[Join Server](${ad.invite})`,
+                        inline: true
+                    },
+                    {
+                        name: "Group",
+                        value: `[View Group](${ad.group})`,
+                        inline: true
+                    }
+                )
+                .setFooter({
+                    text: "ServerSpot • Discover. Advertise. Connect."
+                })
+                .setTimestamp();
+
+            await channel.send({
+                embeds: [publicEmbed]
+            });
+
+            const approvedEmbed = new EmbedBuilder()
+                .setColor(EMBED_COLOR)
+                .setTitle("Advertisement Approved")
+                .addFields(
+                    {
+                        name: "Server",
+                        value: ad.name
+                    },
+                    {
+                        name: "Submitted By",
+                        value: `<@${ad.userId}>`
+                    },
+                    {
+                        name: "Approved By",
+                        value: `<@${interaction.user.id}>`
+                    },
+                    {
+                        name: "Status",
+                        value: "Approved"
+                    }
+                )
+                .setTimestamp();
 
             await interaction.message.edit({
-                embeds: [
-                    approvedLog
-                ],
+                embeds: [approvedEmbed],
                 components: []
             });
 
-            // DM advertiser
             try {
-
-                const user =
-                    await client.users.fetch(
-                        advertisement.userId
-                    );
+                const user = await client.users.fetch(ad.userId);
 
                 await user.send({
                     embeds: [
                         new EmbedBuilder()
-                            .setColor(
-                                EMBED_COLOR
-                            )
-                            .setTitle(
-                                "Advertisement Approved"
-                            )
+                            .setColor(EMBED_COLOR)
+                            .setTitle("Advertisement Approved")
                             .setDescription(
-                                `Your ServerSpot advertisement for **${advertisement.name}** has been approved and published.`
+                                `Your ServerSpot advertisement for **${ad.name}** has been approved and published.`
                             )
                     ]
                 });
-
             } catch {
-                console.log(
-                    "Could not DM advertiser."
-                );
+                console.log("Could not DM advertiser.");
             }
 
-            return interaction.reply({
-                content:
-                    "Advertisement accepted and published.",
-                ephemeral: true
-            });
+            return interaction.editReply(
+                "Advertisement accepted and published."
+            );
         }
 
         // =================================================
@@ -466,85 +485,59 @@ client.on("interactionCreate", async interaction => {
 
         if (
             interaction.isButton() &&
-            interaction.customId.startsWith(
-                "serverspot_decline_"
-            )
+            interaction.customId.startsWith("serverspot_decline_")
         ) {
 
             if (!isStaff(interaction)) {
                 return interaction.reply({
-                    content:
-                        "You do not have permission to decline advertisements.",
-                    ephemeral: true
+                    content: "You do not have permission to decline advertisements.",
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
-            const advertisementId =
-                interaction.customId.replace(
-                    "serverspot_decline_",
-                    ""
-                );
+            const id = interaction.customId.replace(
+                "serverspot_decline_",
+                ""
+            );
 
-            const advertisement =
-                advertisements.get(
-                    advertisementId
-                );
+            const ad = data.advertisements[id];
 
-            if (!advertisement) {
+            if (!ad) {
+                return interaction.reply({
+                    content: "This advertisement could not be found.",
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+
+            if (ad.status !== "Pending") {
                 return interaction.reply({
                     content:
-                        "This advertisement could not be found. It may have expired or the bot may have restarted.",
-                    ephemeral: true
+                        `This advertisement has already been ${ad.status.toLowerCase()}.`,
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
-            if (
-                advertisement.status !==
-                "Pending"
-            ) {
-                return interaction.reply({
-                    content:
-                        `This advertisement has already been ${advertisement.status.toLowerCase()}.`,
-                    ephemeral: true
-                });
-            }
+            const modal = new ModalBuilder()
+                .setCustomId(
+                    `serverspot_decline_modal_${id}`
+                )
+                .setTitle("Decline Advertisement");
 
-            const modal =
-                new ModalBuilder()
-                    .setCustomId(
-                        `serverspot_decline_modal_${advertisementId}`
-                    )
-                    .setTitle(
-                        "Decline Advertisement"
-                    );
-
-            const reason =
-                new TextInputBuilder()
-                    .setCustomId(
-                        "reason"
-                    )
-                    .setLabel(
-                        "Reason for declining"
-                    )
-                    .setStyle(
-                        TextInputStyle.Paragraph
-                    )
-                    .setPlaceholder(
-                        "Explain why this advertisement is being declined..."
-                    )
-                    .setRequired(true)
-                    .setMaxLength(1000);
+            const reason = new TextInputBuilder()
+                .setCustomId("reason")
+                .setLabel("Reason for declining")
+                .setStyle(TextInputStyle.Paragraph)
+                .setPlaceholder(
+                    "Explain why this advertisement is being declined..."
+                )
+                .setRequired(true)
+                .setMaxLength(1000);
 
             modal.addComponents(
-                new ActionRowBuilder()
-                    .addComponents(
-                        reason
-                    )
+                new ActionRowBuilder().addComponents(reason)
             );
 
-            return interaction.showModal(
-                modal
-            );
+            return interaction.showModal(modal);
         }
 
         // =================================================
@@ -560,266 +553,202 @@ client.on("interactionCreate", async interaction => {
 
             if (!isStaff(interaction)) {
                 return interaction.reply({
-                    content:
-                        "You do not have permission to decline advertisements.",
-                    ephemeral: true
+                    content: "You do not have permission to decline advertisements.",
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
-            const advertisementId =
-                interaction.customId.replace(
-                    "serverspot_decline_modal_",
-                    ""
-                );
+            // Acknowledge immediately
+            await interaction.deferReply({
+                flags: MessageFlags.Ephemeral
+            });
 
-            const advertisement =
-                advertisements.get(
-                    advertisementId
-                );
+            const id = interaction.customId.replace(
+                "serverspot_decline_modal_",
+                ""
+            );
 
-            if (!advertisement) {
-                return interaction.reply({
-                    content:
-                        "This advertisement could not be found.",
-                    ephemeral: true
-                });
+            const ad = data.advertisements[id];
+
+            if (!ad) {
+                return interaction.editReply(
+                    "This advertisement could not be found."
+                );
             }
 
-            const reason =
-                interaction.fields.getTextInputValue(
-                    "reason"
+            if (ad.status !== "Pending") {
+                return interaction.editReply(
+                    `This advertisement has already been ${ad.status.toLowerCase()}.`
                 );
+            }
 
-            advertisement.status =
-                "Declined";
+            const reason = interaction.fields.getTextInputValue(
+                "reason"
+            );
 
-            advertisement.declinedBy =
-                interaction.user.id;
+            ad.status = "Declined";
+            ad.declinedBy = interaction.user.id;
+            ad.declineReason = reason;
+            ad.declinedAt = Date.now();
 
-            advertisement.reason =
-                reason;
+            saveData();
 
-            const declinedLog =
-                new EmbedBuilder()
-                    .setColor(EMBED_COLOR)
-                    .setTitle(
-                        "Advertisement Declined"
-                    )
-                    .addFields(
-                        {
-                            name: "Server",
-                            value:
-                                advertisement.name
-                        },
-                        {
-                            name: "Submitted By",
-                            value:
-                                `<@${advertisement.userId}>`
-                        },
-                        {
-                            name: "Declined By",
-                            value:
-                                `<@${interaction.user.id}>`
-                        },
-                        {
-                            name: "Reason",
-                            value:
-                                reason
-                        },
-                        {
-                            name: "Status",
-                            value:
-                                "Declined"
-                        }
-                    )
-                    .setTimestamp();
+            const declinedEmbed = new EmbedBuilder()
+                .setColor(EMBED_COLOR)
+                .setTitle("Advertisement Declined")
+                .addFields(
+                    {
+                        name: "Server",
+                        value: ad.name
+                    },
+                    {
+                        name: "Submitted By",
+                        value: `<@${ad.userId}>`
+                    },
+                    {
+                        name: "Declined By",
+                        value: `<@${interaction.user.id}>`
+                    },
+                    {
+                        name: "Reason",
+                        value: reason
+                    },
+                    {
+                        name: "Status",
+                        value: "Declined"
+                    }
+                )
+                .setTimestamp();
 
             await interaction.message.edit({
-                embeds: [
-                    declinedLog
-                ],
+                embeds: [declinedEmbed],
                 components: []
             });
 
-            // DM advertiser
             try {
-
-                const user =
-                    await client.users.fetch(
-                        advertisement.userId
-                    );
+                const user = await client.users.fetch(ad.userId);
 
                 await user.send({
                     embeds: [
                         new EmbedBuilder()
-                            .setColor(
-                                EMBED_COLOR
-                            )
-                            .setTitle(
-                                "Advertisement Declined"
-                            )
+                            .setColor(EMBED_COLOR)
+                            .setTitle("Advertisement Declined")
                             .setDescription(
-                                `Your ServerSpot advertisement for **${advertisement.name}** was declined.`
+                                `Your ServerSpot advertisement for **${ad.name}** was declined.`
                             )
                             .addFields({
-                                name:
-                                    "Reason",
-                                value:
-                                    reason
+                                name: "Reason",
+                                value: reason
                             })
                     ]
                 });
-
             } catch {
-                console.log(
-                    "Could not DM advertiser."
-                );
+                console.log("Could not DM advertiser.");
             }
 
-            return interaction.reply({
-                content:
-                    "Advertisement declined. The advertiser has been notified.",
-                ephemeral: true
-            });
+            return interaction.editReply(
+                "Advertisement declined. The advertiser has been notified."
+            );
         }
 
         // =================================================
-        // ADVERTISE COMMAND
+        // /ADVERTISE
         // =================================================
 
         if (
             interaction.isChatInputCommand() &&
-            interaction.commandName ===
-                "advertise"
+            interaction.commandName === "advertise"
         ) {
 
             const settings =
-                guildSettings.get(
-                    interaction.guild.id
-                );
+                data.guilds[interaction.guild.id];
 
             if (!settings) {
                 return interaction.reply({
                     content:
-                        "ServerSpot has not been configured yet. Please ask a server administrator to run `/setup`.",
-                    ephemeral: true
+                        "ServerSpot has not been configured yet. Please ask an administrator to run `/setup`.",
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
-            const modal =
-                new ModalBuilder()
-                    .setCustomId(
-                        "serverspot_advertise"
-                    )
-                    .setTitle(
-                        "ServerSpot Advertisement"
-                    );
+            // Make sure channels still exist
+            const logsChannel = await client.channels.fetch(
+                settings.logsChannel
+            ).catch(() => null);
 
-            const name =
-                new TextInputBuilder()
-                    .setCustomId(
-                        "server_name"
-                    )
-                    .setLabel(
-                        "Server Name"
-                    )
-                    .setStyle(
-                        TextInputStyle.Short
-                    )
-                    .setPlaceholder(
-                        "Example Community"
-                    )
-                    .setRequired(true)
-                    .setMaxLength(100);
+            const advertisementChannel = await client.channels.fetch(
+                settings.advertisementChannel
+            ).catch(() => null);
 
-            const invite =
-                new TextInputBuilder()
-                    .setCustomId(
-                        "invite"
-                    )
-                    .setLabel(
-                        "Discord Invite Link"
-                    )
-                    .setStyle(
-                        TextInputStyle.Short
-                    )
-                    .setPlaceholder(
-                        "https://discord.gg/example"
-                    )
-                    .setRequired(true)
-                    .setMaxLength(300);
+            if (!logsChannel || !advertisementChannel) {
+                return interaction.reply({
+                    content:
+                        "ServerSpot's configured channels could not be found. Please ask an administrator to run `/setup` again.",
+                    flags: MessageFlags.Ephemeral
+                });
+            }
 
-            const group =
-                new TextInputBuilder()
-                    .setCustomId(
-                        "group"
-                    )
-                    .setLabel(
-                        "Group Link"
-                    )
-                    .setStyle(
-                        TextInputStyle.Short
-                    )
-                    .setPlaceholder(
-                        "https://example.com/group"
-                    )
-                    .setRequired(true)
-                    .setMaxLength(300);
+            // FORM
 
-            const description =
-                new TextInputBuilder()
-                    .setCustomId(
-                        "description"
-                    )
-                    .setLabel(
-                        "Server Description"
-                    )
-                    .setStyle(
-                        TextInputStyle.Paragraph
-                    )
-                    .setPlaceholder(
-                        "Tell people about your server..."
-                    )
-                    .setRequired(true)
-                    .setMaxLength(1000);
+            const modal = new ModalBuilder()
+                .setCustomId("serverspot_advertise")
+                .setTitle("ServerSpot Advertisement");
 
-            const category =
-                new TextInputBuilder()
-                    .setCustomId(
-                        "category"
-                    )
-                    .setLabel(
-                        "Category"
-                    )
-                    .setStyle(
-                        TextInputStyle.Short
-                    )
-                    .setPlaceholder(
-                        "Gaming, Social, Roleplay..."
-                    )
-                    .setRequired(true)
-                    .setMaxLength(50);
+            const name = new TextInputBuilder()
+                .setCustomId("server_name")
+                .setLabel("Server Name")
+                .setStyle(TextInputStyle.Short)
+                .setPlaceholder("Example Community")
+                .setRequired(true)
+                .setMaxLength(100);
+
+            const invite = new TextInputBuilder()
+                .setCustomId("invite")
+                .setLabel("Discord Invite Link")
+                .setStyle(TextInputStyle.Short)
+                .setPlaceholder("https://discord.gg/example")
+                .setRequired(true)
+                .setMaxLength(300);
+
+            const group = new TextInputBuilder()
+                .setCustomId("group")
+                .setLabel("Group Link")
+                .setStyle(TextInputStyle.Short)
+                .setPlaceholder("https://example.com/group")
+                .setRequired(true)
+                .setMaxLength(300);
+
+            const description = new TextInputBuilder()
+                .setCustomId("description")
+                .setLabel("Server Description")
+                .setStyle(TextInputStyle.Paragraph)
+                .setPlaceholder(
+                    "Tell people about your server..."
+                )
+                .setRequired(true)
+                .setMaxLength(1000);
+
+            const category = new TextInputBuilder()
+                .setCustomId("category")
+                .setLabel("Category")
+                .setStyle(TextInputStyle.Short)
+                .setPlaceholder(
+                    "Gaming, Social, Roleplay..."
+                )
+                .setRequired(true)
+                .setMaxLength(50);
 
             modal.addComponents(
-                new ActionRowBuilder()
-                    .addComponents(name),
-
-                new ActionRowBuilder()
-                    .addComponents(invite),
-
-                new ActionRowBuilder()
-                    .addComponents(group),
-
-                new ActionRowBuilder()
-                    .addComponents(description),
-
-                new ActionRowBuilder()
-                    .addComponents(category)
+                new ActionRowBuilder().addComponents(name),
+                new ActionRowBuilder().addComponents(invite),
+                new ActionRowBuilder().addComponents(group),
+                new ActionRowBuilder().addComponents(description),
+                new ActionRowBuilder().addComponents(category)
             );
 
-            return interaction.showModal(
-                modal
-            );
+            // IMPORTANT:
+            // showModal must happen immediately.
+            return interaction.showModal(modal);
         }
 
         // =================================================
@@ -828,220 +757,171 @@ client.on("interactionCreate", async interaction => {
 
         if (
             interaction.isModalSubmit() &&
-            interaction.customId ===
-                "serverspot_advertise"
+            interaction.customId === "serverspot_advertise"
         ) {
 
+            // Acknowledge immediately so Discord doesn't expire it.
+            await interaction.deferReply({
+                flags: MessageFlags.Ephemeral
+            });
+
             const name =
-                interaction.fields.getTextInputValue(
-                    "server_name"
-                );
+                interaction.fields.getTextInputValue("server_name");
 
             const invite =
-                interaction.fields.getTextInputValue(
-                    "invite"
-                );
+                interaction.fields.getTextInputValue("invite");
 
             const group =
-                interaction.fields.getTextInputValue(
-                    "group"
-                );
+                interaction.fields.getTextInputValue("group");
 
             const description =
-                interaction.fields.getTextInputValue(
-                    "description"
-                );
+                interaction.fields.getTextInputValue("description");
 
             const category =
-                interaction.fields.getTextInputValue(
-                    "category"
-                );
+                interaction.fields.getTextInputValue("category");
 
-            if (
-                !validURL(invite) ||
-                !validURL(group)
-            ) {
-                return interaction.reply({
-                    content:
-                        "Please provide valid links.",
-                    ephemeral: true
-                });
+            // Validate Discord invite
+            if (!validDiscordInvite(invite)) {
+                return interaction.editReply(
+                    "The Discord invite link is invalid. Please use a link such as `https://discord.gg/example`."
+                );
+            }
+
+            // Validate group link
+            if (!validURL(group)) {
+                return interaction.editReply(
+                    "The group link is invalid. Please enter a valid link beginning with `https://`."
+                );
             }
 
             const settings =
-                guildSettings.get(
-                    interaction.guild.id
-                );
+                data.guilds[interaction.guild.id];
 
             if (!settings) {
-                return interaction.reply({
-                    content:
-                        "ServerSpot has not been configured.",
-                    ephemeral: true
-                });
+                return interaction.editReply(
+                    "ServerSpot has not been configured yet. Please ask an administrator to run `/setup`."
+                );
             }
 
-            const logsChannel =
-                await client.channels.fetch(
-                    settings.logsChannel
-                ).catch(() => null);
+            const logsChannel = await client.channels.fetch(
+                settings.logsChannel
+            ).catch(() => null);
 
             if (!logsChannel) {
-                return interaction.reply({
-                    content:
-                        "The advertisement logs channel could not be found.",
-                    ephemeral: true
-                });
+                return interaction.editReply(
+                    "The advertisement logs channel could not be found. Please ask an administrator to run `/setup` again."
+                );
             }
 
             // Unique ID
-            const advertisementId =
-                `${interaction.guild.id}_${interaction.user.id}_${Date.now()}`;
+            const id =
+                `${interaction.guild.id}-${interaction.user.id}-${Date.now()}`;
 
-            const advertisement = {
-                id:
-                    advertisementId,
-
-                guildId:
-                    interaction.guild.id,
-
-                userId:
-                    interaction.user.id,
-
+            // Save advertisement BEFORE sending log
+            data.advertisements[id] = {
+                id,
+                guildId: interaction.guild.id,
+                userId: interaction.user.id,
                 name,
-
                 invite,
-
                 group,
-
                 description,
-
                 category,
-
-                status:
-                    "Pending",
-
-                submittedAt:
-                    Date.now()
+                status: "Pending",
+                submittedAt: Date.now()
             };
 
-            advertisements.set(
-                advertisementId,
-                advertisement
+            saveData();
+
+            const logEmbed = new EmbedBuilder()
+                .setColor(EMBED_COLOR)
+                .setTitle("New Advertisement")
+                .setDescription(
+                    "A new ServerSpot advertisement has been submitted and is awaiting staff review."
+                )
+                .addFields(
+                    {
+                        name: "Server Name",
+                        value: name
+                    },
+                    {
+                        name: "Submitted By",
+                        value: `<@${interaction.user.id}>`,
+                        inline: true
+                    },
+                    {
+                        name: "Category",
+                        value: category,
+                        inline: true
+                    },
+                    {
+                        name: "Discord Invite",
+                        value: `[Open Invite](${invite})`
+                    },
+                    {
+                        name: "Group Link",
+                        value: `[Open Group](${group})`
+                    },
+                    {
+                        name: "Description",
+                        value: description
+                    },
+                    {
+                        name: "Status",
+                        value: "Pending Review"
+                    }
+                )
+                .setFooter({
+                    text: "ServerSpot Advertisement Review"
+                })
+                .setTimestamp();
+
+            const buttons = new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(
+                            `serverspot_accept_${id}`
+                        )
+                        .setLabel("Accept")
+                        .setStyle(ButtonStyle.Success),
+
+                    new ButtonBuilder()
+                        .setCustomId(
+                            `serverspot_decline_${id}`
+                        )
+                        .setLabel("Decline")
+                        .setStyle(ButtonStyle.Danger)
+                );
+
+            try {
+
+                await logsChannel.send({
+                    embeds: [logEmbed],
+                    components: [buttons]
+                });
+
+            } catch (error) {
+
+                console.error(
+                    "Could not send advertisement to logs:",
+                    error
+                );
+
+                delete data.advertisements[id];
+                saveData();
+
+                return interaction.editReply(
+                    "I couldn't send your advertisement to the staff logs. Please contact ServerSpot staff."
+                );
+            }
+
+            return interaction.editReply(
+                "Your advertisement has been submitted successfully and is now awaiting staff review."
             );
-
-            // Logs embed
-            const logEmbed =
-                new EmbedBuilder()
-                    .setColor(EMBED_COLOR)
-                    .setTitle(
-                        "New Advertisement"
-                    )
-                    .setDescription(
-                        "A new server advertisement has been submitted and is awaiting staff review."
-                    )
-                    .addFields(
-                        {
-                            name: "Server Name",
-                            value:
-                                name
-                        },
-                        {
-                            name: "Submitted By",
-                            value:
-                                `<@${interaction.user.id}>`,
-                            inline: true
-                        },
-                        {
-                            name: "Category",
-                            value:
-                                category,
-                            inline: true
-                        },
-                        {
-                            name: "Discord Invite",
-                            value:
-                                `[Open Invite](${invite})`
-                        },
-                        {
-                            name: "Group Link",
-                            value:
-                                `[Open Group](${group})`
-                        },
-                        {
-                            name: "Description",
-                            value:
-                                description
-                        },
-                        {
-                            name: "Status",
-                            value:
-                                "Pending Review"
-                        }
-                    )
-                    .setFooter({
-                        text:
-                            "ServerSpot Advertisement Review"
-                    })
-                    .setTimestamp();
-
-            // Buttons
-            const buttons =
-                new ActionRowBuilder()
-                    .addComponents(
-
-                        new ButtonBuilder()
-                            .setCustomId(
-                                `serverspot_accept_${advertisementId}`
-                            )
-                            .setLabel(
-                                "Accept"
-                            )
-                            .setStyle(
-                                ButtonStyle.Success
-                            ),
-
-                        new ButtonBuilder()
-                            .setCustomId(
-                                `serverspot_decline_${advertisementId}`
-                            )
-                            .setLabel(
-                                "Decline"
-                            )
-                            .setStyle(
-                                ButtonStyle.Danger
-                            )
-
-                    );
-
-            await logsChannel.send({
-                embeds: [
-                    logEmbed
-                ],
-                components: [
-                    buttons
-                ]
-            });
-
-            return interaction.reply({
-                embeds: [
-                    new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "Advertisement Submitted"
-                        )
-                        .setDescription(
-                            "Your advertisement has been sent to the ServerSpot staff team for review."
-                        )
-                ],
-                ephemeral: true
-            });
         }
 
         // =================================================
-        // COMMANDS
+        // ALL CHAT INPUT COMMANDS
         // =================================================
 
         if (!interaction.isChatInputCommand()) {
@@ -1049,73 +929,60 @@ client.on("interactionCreate", async interaction => {
         }
 
         // =================================================
-        // SETUP
+        // /SETUP
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "setup"
-        ) {
+        if (interaction.commandName === "setup") {
 
             if (!isStaff(interaction)) {
                 return interaction.reply({
                     content:
                         "You must be an administrator to use this command.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
+            await interaction.deferReply({
+                flags: MessageFlags.Ephemeral
+            });
+
             const logs =
-                interaction.options.getChannel(
-                    "logs"
-                );
+                interaction.options.getChannel("logs");
 
-            const advertisementsChannel =
-                interaction.options.getChannel(
-                    "advertisements"
-                );
+            const advertisements =
+                interaction.options.getChannel("advertisements");
 
-            guildSettings.set(
-                interaction.guild.id,
-                {
-                    logsChannel:
-                        logs.id,
+            data.guilds[interaction.guild.id] = {
+                logsChannel: logs.id,
+                advertisementChannel: advertisements.id
+            };
 
-                    advertisementChannel:
-                        advertisementsChannel.id
-                }
-            );
+            saveData();
 
-            return interaction.reply({
+            return interaction.editReply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "ServerSpot Setup Complete"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("ServerSpot Setup Complete")
                         .addFields(
                             {
-                                name:
-                                    "Advertisement Logs",
-                                value:
-                                    `${logs}`
+                                name: "Advertisement Logs",
+                                value: `${logs}`
                             },
                             {
-                                name:
-                                    "Advertisement Channel",
-                                value:
-                                    `${advertisementsChannel}`
+                                name: "Advertisement Channel",
+                                value: `${advertisements}`
                             }
                         )
-                ],
-                ephemeral: true
+                        .setFooter({
+                            text: "This configuration will survive bot restarts."
+                        })
+                ]
             });
         }
 
         // =================================================
-        // STAFF COMMANDS
+        // STAFF PERMISSION CHECK
         // =================================================
 
         const staffCommands = [
@@ -1130,122 +997,93 @@ client.on("interactionCreate", async interaction => {
         ];
 
         if (
-            staffCommands.includes(
-                interaction.commandName
-            ) &&
+            staffCommands.includes(interaction.commandName) &&
             !isStaff(interaction)
         ) {
             return interaction.reply({
                 content:
                     "You do not have permission to use this command.",
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
         }
 
         // =================================================
-        // REVIEW
+        // /REVIEW
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "review"
-        ) {
+        if (interaction.commandName === "review") {
 
             const pending =
-                [...advertisements.values()]
-                    .filter(
-                        ad =>
-                            ad.status ===
-                            "Pending"
-                    );
+                Object.values(data.advertisements)
+                    .filter(ad => ad.status === "Pending");
 
             if (!pending.length) {
                 return interaction.reply({
                     content:
                         "There are no pending advertisements.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
-            const list =
-                pending
-                    .slice(0, 20)
-                    .map(
-                        ad =>
-                            `**${ad.name}** — <@${ad.userId}>`
-                    )
-                    .join("\n");
+            const list = pending
+                .slice(0, 20)
+                .map(
+                    ad =>
+                        `**${ad.name}** — <@${ad.userId}>`
+                )
+                .join("\n");
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "Pending Advertisements"
-                        )
-                        .setDescription(
-                            list
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("Pending Advertisements")
+                        .setDescription(list)
                 ],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
         }
 
         // =================================================
-        // REMOVE
+        // /REMOVE
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "remove"
-        ) {
+        if (interaction.commandName === "remove") {
 
             const name =
                 interaction.options
-                    .getString(
-                        "name"
-                    )
+                    .getString("name")
                     .toLowerCase();
 
-            const entry =
-                [...advertisements.entries()]
+            const ad =
+                Object.values(data.advertisements)
                     .find(
-                        ([id, ad]) =>
-                            ad.name
-                                .toLowerCase() ===
-                            name
+                        ad =>
+                            ad.name.toLowerCase() === name
                     );
 
-            if (!entry) {
+            if (!ad) {
                 return interaction.reply({
                     content:
                         "That server could not be found.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
-            const [id, ad] =
-                entry;
+            delete data.advertisements[ad.id];
 
-            advertisements.delete(
-                id
-            );
+            data.featured =
+                data.featured.filter(
+                    id => id !== ad.id
+                );
 
-            featured.delete(
-                id
-            );
+            saveData();
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "Advertisement Removed"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("Advertisement Removed")
                         .setDescription(
                             `**${ad.name}** has been removed from ServerSpot.`
                         )
@@ -1254,53 +1092,43 @@ client.on("interactionCreate", async interaction => {
         }
 
         // =================================================
-        // FEATURE
+        // /FEATURE
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "feature"
-        ) {
+        if (interaction.commandName === "feature") {
 
             const name =
                 interaction.options
-                    .getString(
-                        "name"
-                    )
+                    .getString("name")
                     .toLowerCase();
 
             const ad =
-                [...advertisements.values()]
+                Object.values(data.advertisements)
                     .find(
                         ad =>
-                            ad.name
-                                .toLowerCase() ===
-                                name &&
-                            ad.status ===
-                                "Approved"
+                            ad.name.toLowerCase() === name &&
+                            ad.status === "Approved"
                     );
 
             if (!ad) {
                 return interaction.reply({
                     content:
                         "That approved server could not be found.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
-            featured.add(
-                ad.id
-            );
+            if (!data.featured.includes(ad.id)) {
+                data.featured.push(ad.id);
+            }
+
+            saveData();
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "Server Featured"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("Server Featured")
                         .setDescription(
                             `**${ad.name}** is now featured.`
                         )
@@ -1309,51 +1137,43 @@ client.on("interactionCreate", async interaction => {
         }
 
         // =================================================
-        // UNFEATURE
+        // /UNFEATURE
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "unfeature"
-        ) {
+        if (interaction.commandName === "unfeature") {
 
             const name =
                 interaction.options
-                    .getString(
-                        "name"
-                    )
+                    .getString("name")
                     .toLowerCase();
 
             const ad =
-                [...advertisements.values()]
+                Object.values(data.advertisements)
                     .find(
                         ad =>
-                            ad.name
-                                .toLowerCase() ===
-                            name
+                            ad.name.toLowerCase() === name
                     );
 
             if (!ad) {
                 return interaction.reply({
                     content:
                         "That server could not be found.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
-            featured.delete(
-                ad.id
-            );
+            data.featured =
+                data.featured.filter(
+                    id => id !== ad.id
+                );
+
+            saveData();
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "Server Unfeatured"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("Server Unfeatured")
                         .setDescription(
                             `**${ad.name}** has been removed from featured servers.`
                         )
@@ -1362,34 +1182,27 @@ client.on("interactionCreate", async interaction => {
         }
 
         // =================================================
-        // BLACKLIST
+        // /BLACKLIST
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "blacklist"
-        ) {
+        if (interaction.commandName === "blacklist") {
 
             const name =
                 interaction.options
-                    .getString(
-                        "name"
-                    )
+                    .getString("name")
                     .toLowerCase();
 
-            blacklisted.add(
-                name
-            );
+            if (!data.blacklisted.includes(name)) {
+                data.blacklisted.push(name);
+            }
+
+            saveData();
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "Server Blacklisted"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("Server Blacklisted")
                         .setDescription(
                             `**${name}** has been blacklisted.`
                         )
@@ -1398,34 +1211,28 @@ client.on("interactionCreate", async interaction => {
         }
 
         // =================================================
-        // UNBLACKLIST
+        // /UNBLACKLIST
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "unblacklist"
-        ) {
+        if (interaction.commandName === "unblacklist") {
 
             const name =
                 interaction.options
-                    .getString(
-                        "name"
-                    )
+                    .getString("name")
                     .toLowerCase();
 
-            blacklisted.delete(
-                name
-            );
+            data.blacklisted =
+                data.blacklisted.filter(
+                    server => server !== name
+                );
+
+            saveData();
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "Blacklist Removed"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("Blacklist Removed")
                         .setDescription(
                             `**${name}** has been removed from the blacklist.`
                         )
@@ -1434,161 +1241,110 @@ client.on("interactionCreate", async interaction => {
         }
 
         // =================================================
-        // STATS
+        // /STATS
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "stats"
-        ) {
+        if (interaction.commandName === "stats") {
 
-            const total =
-                advertisements.size;
+            const advertisements =
+                Object.values(data.advertisements);
 
             const approved =
-                [...advertisements.values()]
-                    .filter(
-                        ad =>
-                            ad.status ===
-                            "Approved"
-                    ).length;
+                advertisements.filter(
+                    ad => ad.status === "Approved"
+                ).length;
 
             const pending =
-                [...advertisements.values()]
-                    .filter(
-                        ad =>
-                            ad.status ===
-                            "Pending"
-                    ).length;
+                advertisements.filter(
+                    ad => ad.status === "Pending"
+                ).length;
 
             const declined =
-                [...advertisements.values()]
-                    .filter(
-                        ad =>
-                            ad.status ===
-                            "Declined"
-                    ).length;
+                advertisements.filter(
+                    ad => ad.status === "Declined"
+                ).length;
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "ServerSpot Statistics"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("ServerSpot Statistics")
                         .addFields(
                             {
-                                name:
-                                    "Total",
-                                value:
-                                    `${total}`,
-                                inline:
-                                    true
+                                name: "Total",
+                                value: `${advertisements.length}`,
+                                inline: true
                             },
                             {
-                                name:
-                                    "Approved",
-                                value:
-                                    `${approved}`,
-                                inline:
-                                    true
+                                name: "Approved",
+                                value: `${approved}`,
+                                inline: true
                             },
                             {
-                                name:
-                                    "Pending",
-                                value:
-                                    `${pending}`,
-                                inline:
-                                    true
+                                name: "Pending",
+                                value: `${pending}`,
+                                inline: true
                             },
                             {
-                                name:
-                                    "Declined",
-                                value:
-                                    `${declined}`,
-                                inline:
-                                    true
+                                name: "Declined",
+                                value: `${declined}`,
+                                inline: true
                             },
                             {
-                                name:
-                                    "Featured",
-                                value:
-                                    `${featured.size}`,
-                                inline:
-                                    true
+                                name: "Featured",
+                                value: `${data.featured.length}`,
+                                inline: true
                             },
                             {
-                                name:
-                                    "Blacklisted",
-                                value:
-                                    `${blacklisted.size}`,
-                                inline:
-                                    true
+                                name: "Blacklisted",
+                                value: `${data.blacklisted.length}`,
+                                inline: true
                             }
                         )
                 ],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
         }
 
         // =================================================
-        // ANNOUNCE
+        // /ANNOUNCE
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "announce"
-        ) {
+        if (interaction.commandName === "announce") {
 
             const message =
-                interaction.options.getString(
-                    "message"
-                );
+                interaction.options.getString("message");
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "ServerSpot Announcement"
-                        )
-                        .setDescription(
-                            message
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("ServerSpot Announcement")
+                        .setDescription(message)
                         .setFooter({
-                            text:
-                                "ServerSpot"
+                            text: "ServerSpot"
                         })
                 ]
             });
         }
 
         // =================================================
-        // BROWSE
+        // /BROWSE
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "browse"
-        ) {
+        if (interaction.commandName === "browse") {
 
             const results =
-                [...advertisements.values()]
+                Object.values(data.advertisements)
                     .filter(
-                        ad =>
-                            ad.status ===
-                            "Approved"
+                        ad => ad.status === "Approved"
                     );
 
             if (!results.length) {
                 return interaction.reply({
                     content:
                         "There are currently no approved advertisements.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
@@ -1604,57 +1360,33 @@ client.on("interactionCreate", async interaction => {
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "ServerSpot Listings"
-                        )
-                        .setDescription(
-                            list
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("ServerSpot Listings")
+                        .setDescription(list)
                 ]
             });
         }
 
         // =================================================
-        // SEARCH
+        // /SEARCH
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "search"
-        ) {
+        if (interaction.commandName === "search") {
 
             const query =
                 interaction.options
-                    .getString(
-                        "query"
-                    )
+                    .getString("query")
                     .toLowerCase();
 
             const results =
-                [...advertisements.values()]
+                Object.values(data.advertisements)
                     .filter(
                         ad =>
-                            ad.status ===
-                                "Approved" &&
+                            ad.status === "Approved" &&
                             (
-                                ad.name
-                                    .toLowerCase()
-                                    .includes(
-                                        query
-                                    ) ||
-                                ad.description
-                                    .toLowerCase()
-                                    .includes(
-                                        query
-                                    ) ||
-                                ad.category
-                                    .toLowerCase()
-                                    .includes(
-                                        query
-                                    )
+                                ad.name.toLowerCase().includes(query) ||
+                                ad.description.toLowerCase().includes(query) ||
+                                ad.category.toLowerCase().includes(query)
                             )
                     );
 
@@ -1662,7 +1394,7 @@ client.on("interactionCreate", async interaction => {
                 return interaction.reply({
                     content:
                         "No matching servers were found.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
@@ -1678,90 +1410,61 @@ client.on("interactionCreate", async interaction => {
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "Search Results"
-                        )
-                        .setDescription(
-                            list
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("Search Results")
+                        .setDescription(list)
                 ]
             });
         }
 
         // =================================================
-        // SERVER
+        // /SERVER
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "server"
-        ) {
+        if (interaction.commandName === "server") {
 
             const name =
                 interaction.options
-                    .getString(
-                        "name"
-                    )
+                    .getString("name")
                     .toLowerCase();
 
             const ad =
-                [...advertisements.values()]
+                Object.values(data.advertisements)
                     .find(
                         ad =>
-                            ad.status ===
-                                "Approved" &&
-                            ad.name
-                                .toLowerCase() ===
-                                name
+                            ad.status === "Approved" &&
+                            ad.name.toLowerCase() === name
                     );
 
             if (!ad) {
                 return interaction.reply({
                     content:
                         "That server could not be found.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            ad.name
-                        )
-                        .setDescription(
-                            ad.description
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle(ad.name)
+                        .setDescription(ad.description)
                         .addFields(
                             {
-                                name:
-                                    "Category",
-                                value:
-                                    ad.category,
-                                inline:
-                                    true
+                                name: "Category",
+                                value: ad.category,
+                                inline: true
                             },
                             {
-                                name:
-                                    "Discord",
-                                value:
-                                    `[Join Server](${ad.invite})`,
-                                inline:
-                                    true
+                                name: "Discord",
+                                value: `[Join Server](${ad.invite})`,
+                                inline: true
                             },
                             {
-                                name:
-                                    "Group",
-                                value:
-                                    `[View Group](${ad.group})`,
-                                inline:
-                                    true
+                                name: "Group",
+                                value: `[View Group](${ad.group})`,
+                                inline: true
                             }
                         )
                 ]
@@ -1769,34 +1472,25 @@ client.on("interactionCreate", async interaction => {
         }
 
         // =================================================
-        // FEATURED
+        // /FEATURED
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "featured"
-        ) {
+        if (interaction.commandName === "featured") {
 
             const results =
-                [...featured]
-                    .map(
-                        id =>
-                            advertisements.get(
-                                id
-                            )
-                    )
+                data.featured
+                    .map(id => data.advertisements[id])
                     .filter(
                         ad =>
                             ad &&
-                            ad.status ===
-                                "Approved"
+                            ad.status === "Approved"
                     );
 
             if (!results.length) {
                 return interaction.reply({
                     content:
                         "There are currently no featured servers.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
@@ -1811,37 +1505,24 @@ client.on("interactionCreate", async interaction => {
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "Featured Servers"
-                        )
-                        .setDescription(
-                            list
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("Featured Servers")
+                        .setDescription(list)
                 ]
             });
         }
 
         // =================================================
-        // CATEGORIES
+        // /CATEGORIES
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "categories"
-        ) {
+        if (interaction.commandName === "categories") {
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "ServerSpot Categories"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("ServerSpot Categories")
                         .setDescription(
                             "Gaming\n" +
                             "Social\n" +
@@ -1857,49 +1538,35 @@ client.on("interactionCreate", async interaction => {
         }
 
         // =================================================
-        // ABOUT
+        // /ABOUT
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "about"
-        ) {
+        if (interaction.commandName === "about") {
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "About ServerSpot"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("About ServerSpot")
                         .setDescription(
                             "ServerSpot helps people discover new Discord communities and gives server owners a place to showcase their servers.\n\n" +
-                            "Discover. Advertise. Connect."
+                            "**Discover. Advertise. Connect.**"
                         )
                 ]
             });
         }
 
         // =================================================
-        // RULES
+        // /RULES
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "rules"
-        ) {
+        if (interaction.commandName === "rules") {
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "ServerSpot Guidelines"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("ServerSpot Guidelines")
                         .setDescription(
                             "**1. Respect others**\n" +
                             "Treat members, server owners and staff with respect.\n\n" +
@@ -1921,23 +1588,16 @@ client.on("interactionCreate", async interaction => {
         }
 
         // =================================================
-        // HELP
+        // /HELP
         // =================================================
 
-        if (
-            interaction.commandName ===
-            "help"
-        ) {
+        if (interaction.commandName === "help") {
 
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
-                        .setColor(
-                            EMBED_COLOR
-                        )
-                        .setTitle(
-                            "ServerSpot Commands"
-                        )
+                        .setColor(EMBED_COLOR)
+                        .setTitle("ServerSpot Commands")
                         .setDescription(
                             "**User Commands**\n\n" +
                             "`/advertise` — Submit a server advertisement\n" +
@@ -1962,44 +1622,62 @@ client.on("interactionCreate", async interaction => {
                             "`/announce` — Send an announcement"
                         )
                 ],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
         }
 
     } catch (error) {
 
-        console.error(
-            "Interaction error:",
-            error
-        );
+        console.error("Interaction error:", error);
 
-        if (
-            !interaction.replied &&
-            !interaction.deferred
-        ) {
+        try {
 
-            await interaction.reply({
-                content:
-                    "Something went wrong while processing this request.",
-                ephemeral: true
-            }).catch(() => {});
+            if (
+                interaction.isRepliable() &&
+                !interaction.replied &&
+                !interaction.deferred
+            ) {
+                await interaction.reply({
+                    content:
+                        "Something went wrong while processing this request.",
+                    flags: MessageFlags.Ephemeral
+                });
+            } else if (
+                interaction.deferred &&
+                !interaction.replied
+            ) {
+                await interaction.editReply(
+                    "Something went wrong while processing this request."
+                );
+            }
 
+        } catch (replyError) {
+            console.error(
+                "Could not send error response:",
+                replyError
+            );
         }
     }
-
 });
 
 // =====================================================
-// START BOT
+// DISCORD ERROR HANDLING
 // =====================================================
 
-if (!TOKEN || !CLIENT_ID) {
+client.on("error", error => {
+    console.error("Discord client error:", error);
+});
 
-    console.error(
-        "DISCORD_TOKEN or CLIENT_ID is missing."
-    );
+process.on("unhandledRejection", error => {
+    console.error("Unhandled promise rejection:", error);
+});
 
-    process.exit(1);
-}
+process.on("uncaughtException", error => {
+    console.error("Uncaught exception:", error);
+});
+
+// =====================================================
+// LOGIN
+// =====================================================
 
 client.login(TOKEN);
