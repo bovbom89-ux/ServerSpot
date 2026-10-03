@@ -12,11 +12,12 @@ const {
     ModalBuilder,
     TextInputBuilder,
     TextInputStyle,
+    ChannelSelectMenuBuilder,
     ChannelType
 } = require("discord.js");
 
 // ============================================================
-// SERVERSPOT
+// CONFIG
 // ============================================================
 
 const TOKEN = process.env.TOKEN;
@@ -34,8 +35,7 @@ if (!CLIENT_ID) {
 
 const COLOR = 0xE00000;
 
-// In-memory configuration.
-// For a permanent production database, replace this with a database.
+// Server configurations
 const configurations = new Map();
 
 // ============================================================
@@ -54,42 +54,26 @@ const client = new Client({
 // ============================================================
 
 const commands = [
-
     new SlashCommandBuilder()
         .setName("setup")
-        .setDescription("Configure ServerSpot for this server.")
-        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-        .addChannelOption(option =>
-            option
-                .setName("advertisement_logs")
-                .setDescription("Channel where advertisement submissions are reviewed.")
-                .addChannelTypes(ChannelType.GuildText)
-                .setRequired(true)
-        )
-        .addChannelOption(option =>
-            option
-                .setName("featured_servers")
-                .setDescription("Channel where approved advertisements are posted.")
-                .addChannelTypes(ChannelType.GuildText)
-                .setRequired(true)
-        ),
+        .setDescription("Open the ServerSpot setup panel.")
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
     new SlashCommandBuilder()
         .setName("advertise")
-        .setDescription("Submit a server advertisement to ServerSpot."),
+        .setDescription("Submit a server advertisement."),
 
     new SlashCommandBuilder()
         .setName("serverinfo")
-        .setDescription("View information about this ServerSpot server."),
+        .setDescription("View information about this server."),
 
     new SlashCommandBuilder()
         .setName("help")
         .setDescription("View ServerSpot commands.")
-
 ].map(command => command.toJSON());
 
 // ============================================================
-// REGISTER COMMANDS
+// COMMAND REGISTRATION
 // ============================================================
 
 async function registerCommands() {
@@ -100,7 +84,9 @@ async function registerCommands() {
 
         await rest.put(
             Routes.applicationCommands(CLIENT_ID),
-            { body: commands }
+            {
+                body: commands
+            }
         );
 
         console.log("ServerSpot commands registered successfully.");
@@ -125,19 +111,247 @@ client.once("clientReady", async () => {
 });
 
 // ============================================================
-// SETUP
+// SAFE RESPONSE
 // ============================================================
 
-async function handleSetup(interaction) {
-    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-        return interaction.reply({
-            content: "You need the **Manage Server** permission to use this command.",
+async function safeReply(interaction, data) {
+    try {
+        if (interaction.replied) {
+            return await interaction.followUp(data);
+        }
+
+        if (interaction.deferred) {
+            return await interaction.editReply(data);
+        }
+
+        return await interaction.reply(data);
+    } catch (error) {
+        console.error("Interaction response failed:", error);
+    }
+}
+
+// ============================================================
+// SETUP PANEL
+// ============================================================
+
+async function openSetupPanel(interaction) {
+    if (
+        !interaction.memberPermissions ||
+        !interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)
+    ) {
+        return safeReply(interaction, {
+            content: "You need the **Manage Server** permission to configure ServerSpot.",
             ephemeral: true
         });
     }
 
-    const logsChannel = interaction.options.getChannel("advertisement_logs");
-    const featuredChannel = interaction.options.getChannel("featured_servers");
+    const existing = configurations.get(interaction.guild.id);
+
+    const embed = new EmbedBuilder()
+        .setColor(COLOR)
+        .setTitle("ServerSpot Setup")
+        .setDescription(
+            "Configure the channels ServerSpot will use.\n\n" +
+            "Use the selectors below to choose where advertisement submissions are reviewed and where approved servers are published."
+        )
+        .addFields(
+            {
+                name: "Advertisement Logs",
+                value: existing?.logsChannelId
+                    ? `<#${existing.logsChannelId}>`
+                    : "Not configured",
+                inline: true
+            },
+            {
+                name: "Featured Servers",
+                value: existing?.featuredChannelId
+                    ? `<#${existing.featuredChannelId}>`
+                    : "Not configured",
+                inline: true
+            }
+        )
+        .setFooter({
+            text: "ServerSpot • Setup Panel"
+        })
+        .setTimestamp();
+
+    const logsSelector = new ChannelSelectMenuBuilder()
+        .setCustomId("serverspot_setup_logs")
+        .setPlaceholder("Select advertisement logs channel")
+        .setChannelTypes(ChannelType.GuildText)
+        .setMinValues(1)
+        .setMaxValues(1);
+
+    const featuredSelector = new ChannelSelectMenuBuilder()
+        .setCustomId("serverspot_setup_featured")
+        .setPlaceholder("Select featured servers channel")
+        .setChannelTypes(ChannelType.GuildText)
+        .setMinValues(1)
+        .setMaxValues(1);
+
+    const saveButton = new ButtonBuilder()
+        .setCustomId("serverspot_setup_save")
+        .setLabel("Save Setup")
+        .setStyle(ButtonStyle.Success);
+
+    const cancelButton = new ButtonBuilder()
+        .setCustomId("serverspot_setup_cancel")
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Secondary);
+
+    return safeReply(interaction, {
+        embeds: [embed],
+        components: [
+            new ActionRowBuilder().addComponents(logsSelector),
+            new ActionRowBuilder().addComponents(featuredSelector),
+            new ActionRowBuilder().addComponents(
+                saveButton,
+                cancelButton
+            )
+        ],
+        ephemeral: true
+    });
+}
+
+// ============================================================
+// SETUP SELECTORS
+// ============================================================
+
+async function handleSetupSelector(interaction) {
+    if (
+        !interaction.memberPermissions ||
+        !interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)
+    ) {
+        return safeReply(interaction, {
+            content: "You do not have permission to configure ServerSpot.",
+            ephemeral: true
+        });
+    }
+
+    const selectedChannel = interaction.values[0];
+
+    let setup = configurations.get(interaction.guild.id) || {};
+
+    if (interaction.customId === "serverspot_setup_logs") {
+        setup.pendingLogsChannelId = selectedChannel;
+    }
+
+    if (interaction.customId === "serverspot_setup_featured") {
+        setup.pendingFeaturedChannelId = selectedChannel;
+    }
+
+    configurations.set(interaction.guild.id, setup);
+
+    const logsChannel =
+        setup.pendingLogsChannelId ||
+        setup.logsChannelId;
+
+    const featuredChannel =
+        setup.pendingFeaturedChannelId ||
+        setup.featuredChannelId;
+
+    const embed = new EmbedBuilder()
+        .setColor(COLOR)
+        .setTitle("ServerSpot Setup")
+        .setDescription(
+            "Your channel selections have been updated. Review them below and press **Save Setup** when you're ready."
+        )
+        .addFields(
+            {
+                name: "Advertisement Logs",
+                value: logsChannel
+                    ? `<#${logsChannel}>`
+                    : "Not selected",
+                inline: true
+            },
+            {
+                name: "Featured Servers",
+                value: featuredChannel
+                    ? `<#${featuredChannel}>`
+                    : "Not selected",
+                inline: true
+            }
+        )
+        .setFooter({
+            text: "ServerSpot • Setup Panel"
+        })
+        .setTimestamp();
+
+    const logsSelector = new ChannelSelectMenuBuilder()
+        .setCustomId("serverspot_setup_logs")
+        .setPlaceholder("Select advertisement logs channel")
+        .setChannelTypes(ChannelType.GuildText)
+        .setMinValues(1)
+        .setMaxValues(1);
+
+    const featuredSelector = new ChannelSelectMenuBuilder()
+        .setCustomId("serverspot_setup_featured")
+        .setPlaceholder("Select featured servers channel")
+        .setChannelTypes(ChannelType.GuildText)
+        .setMinValues(1)
+        .setMaxValues(1);
+
+    const saveButton = new ButtonBuilder()
+        .setCustomId("serverspot_setup_save")
+        .setLabel("Save Setup")
+        .setStyle(ButtonStyle.Success);
+
+    const cancelButton = new ButtonBuilder()
+        .setCustomId("serverspot_setup_cancel")
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Secondary);
+
+    return interaction.update({
+        embeds: [embed],
+        components: [
+            new ActionRowBuilder().addComponents(logsSelector),
+            new ActionRowBuilder().addComponents(featuredSelector),
+            new ActionRowBuilder().addComponents(
+                saveButton,
+                cancelButton
+            )
+        ]
+    });
+}
+
+// ============================================================
+// SAVE SETUP
+// ============================================================
+
+async function saveSetup(interaction) {
+    const setup = configurations.get(interaction.guild.id);
+
+    if (!setup?.pendingLogsChannelId || !setup?.pendingFeaturedChannelId) {
+        return safeReply(interaction, {
+            content:
+                "Please select **both** an Advertisement Logs channel and a Featured Servers channel before saving.",
+            ephemeral: true
+        });
+    }
+
+    const logsChannel = await interaction.guild.channels
+        .fetch(setup.pendingLogsChannelId)
+        .catch(() => null);
+
+    const featuredChannel = await interaction.guild.channels
+        .fetch(setup.pendingFeaturedChannelId)
+        .catch(() => null);
+
+    if (!logsChannel || !featuredChannel) {
+        return safeReply(interaction, {
+            content:
+                "One or more selected channels could not be found. Please select them again.",
+            ephemeral: true
+        });
+    }
+
+    if (!logsChannel.isTextBased() || !featuredChannel.isTextBased()) {
+        return safeReply(interaction, {
+            content:
+                "Both selected channels must be text-based channels.",
+            ephemeral: true
+        });
+    }
 
     configurations.set(interaction.guild.id, {
         logsChannelId: logsChannel.id,
@@ -145,10 +359,10 @@ async function handleSetup(interaction) {
     });
 
     const embed = new EmbedBuilder()
-        .setColor(COLOR)
-        .setTitle("ServerSpot Configured")
+        .setColor(0x2ECC71)
+        .setTitle("ServerSpot Setup Complete")
         .setDescription(
-            "ServerSpot has been successfully configured for this server."
+            "ServerSpot has been successfully configured."
         )
         .addFields(
             {
@@ -163,13 +377,13 @@ async function handleSetup(interaction) {
             }
         )
         .setFooter({
-            text: "ServerSpot"
+            text: "ServerSpot • Configuration saved"
         })
         .setTimestamp();
 
-    return interaction.reply({
+    return interaction.update({
         embeds: [embed],
-        ephemeral: true
+        components: []
     });
 }
 
@@ -180,15 +394,12 @@ async function handleSetup(interaction) {
 async function showAdvertiseModal(interaction) {
     const config = configurations.get(interaction.guild.id);
 
-    if (!config) {
-        return safeReply(
-            interaction,
-            {
-                content:
-                    "ServerSpot has not been configured yet. Please ask a server administrator to run `/setup`.",
-                ephemeral: true
-            }
-        );
+    if (!config?.logsChannelId || !config?.featuredChannelId) {
+        return safeReply(interaction, {
+            content:
+                "ServerSpot has not been configured yet. Please ask a server administrator to run `/setup`.",
+            ephemeral: true
+        });
     }
 
     const modal = new ModalBuilder()
@@ -214,7 +425,7 @@ async function showAdvertiseModal(interaction) {
     const descriptionInput = new TextInputBuilder()
         .setCustomId("server_description")
         .setLabel("Server Description")
-        .setPlaceholder("Tell people what makes your community worth joining...")
+        .setPlaceholder("Tell people about your community...")
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(1000);
@@ -222,7 +433,7 @@ async function showAdvertiseModal(interaction) {
     const imageInput = new TextInputBuilder()
         .setCustomId("server_image")
         .setLabel("Server Image URL")
-        .setPlaceholder("https://example.com/server-image.png")
+        .setPlaceholder("https://example.com/image.png")
         .setStyle(TextInputStyle.Short)
         .setRequired(false)
         .setMaxLength(500);
@@ -247,7 +458,7 @@ async function showAdvertiseModal(interaction) {
 }
 
 // ============================================================
-// URL VALIDATION
+// VALIDATION
 // ============================================================
 
 function isValidUrl(value) {
@@ -269,50 +480,44 @@ function isDiscordInvite(value) {
 }
 
 // ============================================================
-// SAFE INTERACTION RESPONSE
-// ============================================================
-
-async function safeReply(interaction, data) {
-    try {
-        if (interaction.replied) {
-            return await interaction.followUp(data);
-        }
-
-        if (interaction.deferred) {
-            return await interaction.editReply(data);
-        }
-
-        return await interaction.reply(data);
-    } catch (error) {
-        console.error("Interaction response failed:", error);
-    }
-}
-
-// ============================================================
 // ADVERTISEMENT SUBMISSION
 // ============================================================
 
 async function handleAdvertisement(interaction) {
     const config = configurations.get(interaction.guild.id);
 
-    if (!config) {
+    if (!config?.logsChannelId || !config?.featuredChannelId) {
         return safeReply(interaction, {
             content:
-                "ServerSpot has not been configured yet. Please ask a server administrator to run `/setup`.",
+                "ServerSpot has not been configured yet. Please ask an administrator to run `/setup`.",
             ephemeral: true
         });
     }
 
-    const invite = interaction.fields.getTextInputValue("server_invite").trim();
-    const groupLink = interaction.fields.getTextInputValue("group_link").trim();
-    const description = interaction.fields.getTextInputValue("server_description").trim();
-    const image = interaction.fields.getTextInputValue("server_image").trim();
-    const status = interaction.fields.getTextInputValue("server_status").trim();
+    const invite = interaction.fields
+        .getTextInputValue("server_invite")
+        .trim();
+
+    const groupLink = interaction.fields
+        .getTextInputValue("group_link")
+        .trim();
+
+    const description = interaction.fields
+        .getTextInputValue("server_description")
+        .trim();
+
+    const image = interaction.fields
+        .getTextInputValue("server_image")
+        .trim();
+
+    const status = interaction.fields
+        .getTextInputValue("server_status")
+        .trim();
 
     if (!isDiscordInvite(invite)) {
         return safeReply(interaction, {
             content:
-                "That doesn't look like a valid Discord invite link.",
+                "Please provide a valid Discord invite link.",
             ephemeral: true
         });
     }
@@ -320,7 +525,7 @@ async function handleAdvertisement(interaction) {
     if (!isValidUrl(groupLink)) {
         return safeReply(interaction, {
             content:
-                "The group / website link must be a valid URL.",
+                "Please provide a valid group or website link.",
             ephemeral: true
         });
     }
@@ -328,7 +533,7 @@ async function handleAdvertisement(interaction) {
     if (image && !isValidUrl(image)) {
         return safeReply(interaction, {
             content:
-                "The image URL must be a valid URL.",
+                "The image URL you provided is not valid.",
             ephemeral: true
         });
     }
@@ -340,22 +545,25 @@ async function handleAdvertisement(interaction) {
     if (!logsChannel || !logsChannel.isTextBased()) {
         return safeReply(interaction, {
             content:
-                "The configured advertisement logs channel could not be found. Please ask staff to run `/setup` again.",
+                "The Advertisement Logs channel could not be found. Please run `/setup` again.",
             ephemeral: true
         });
     }
 
-    const memberCount = interaction.guild.memberCount;
-
-    const reviewEmbed = new EmbedBuilder()
+    const embed = new EmbedBuilder()
         .setColor(COLOR)
         .setTitle("New Server Advertisement")
         .setDescription(description)
         .addFields(
             {
                 name: "Submitted By",
-                value: `${interaction.user} \`${interaction.user.id}\``,
+                value: `${interaction.user}\n\`${interaction.user.id}\``,
                 inline: false
+            },
+            {
+                name: "Status",
+                value: status,
+                inline: true
             },
             {
                 name: "Discord Invite",
@@ -366,25 +574,15 @@ async function handleAdvertisement(interaction) {
                 name: "Group / Website",
                 value: `[Open Link](${groupLink})`,
                 inline: true
-            },
-            {
-                name: "Status",
-                value: status,
-                inline: true
-            },
-            {
-                name: "Members",
-                value: memberCount.toLocaleString(),
-                inline: true
             }
         )
         .setFooter({
-            text: "ServerSpot • Awaiting staff review"
+            text: "ServerSpot • Awaiting review"
         })
         .setTimestamp();
 
     if (image) {
-        reviewEmbed.setThumbnail(image);
+        embed.setThumbnail(image);
     }
 
     const buttons = new ActionRowBuilder().addComponents(
@@ -400,55 +598,52 @@ async function handleAdvertisement(interaction) {
     );
 
     const message = await logsChannel.send({
-        embeds: [reviewEmbed],
+        embeds: [embed],
         components: [buttons]
     });
 
-    // Store the submission information on the message itself.
-    // This avoids relying on a fragile temporary interaction.
-    const submissionData = {
-        invite,
-        groupLink,
-        description,
-        image,
-        status,
-        userId: interaction.user.id,
-        guildId: interaction.guild.id,
-        reviewMessageId: message.id
-    };
-
-    // Store it in memory.
     configurations.set(
         `${interaction.guild.id}:${message.id}`,
-        submissionData
+        {
+            invite,
+            groupLink,
+            description,
+            image,
+            status,
+            userId: interaction.user.id,
+            guildId: interaction.guild.id,
+            reviewMessageId: message.id
+        }
     );
 
-    await safeReply(interaction, {
+    return safeReply(interaction, {
         content:
-            "Your advertisement has been submitted successfully and is now awaiting staff review.",
+            "Your advertisement has been submitted for staff review.",
         ephemeral: true
     });
 }
 
 // ============================================================
-// APPROVE / DECLINE
+// REVIEW BUTTONS
 // ============================================================
 
-async function handleReviewButton(interaction) {
+async function handleReview(interaction) {
     if (
         !interaction.memberPermissions?.has(
             PermissionFlagsBits.ManageGuild
         )
     ) {
         return safeReply(interaction, {
-            content: "You do not have permission to review advertisements.",
+            content:
+                "You do not have permission to review advertisements.",
             ephemeral: true
         });
     }
 
-    const submission = configurations.get(
-        `${interaction.guild.id}:${interaction.message.id}`
-    );
+    const key =
+        `${interaction.guild.id}:${interaction.message.id}`;
+
+    const submission = configurations.get(key);
 
     if (!submission) {
         return safeReply(interaction, {
@@ -463,7 +658,9 @@ async function handleReviewButton(interaction) {
     // --------------------------------------------------------
 
     if (interaction.customId === "serverspot_decline") {
-        const updatedEmbed = EmbedBuilder.from(interaction.message.embeds[0])
+        const embed = EmbedBuilder.from(
+            interaction.message.embeds[0]
+        )
             .setColor(0x555555)
             .setFooter({
                 text: `ServerSpot • Declined by ${interaction.user.tag}`
@@ -471,23 +668,21 @@ async function handleReviewButton(interaction) {
             .setTimestamp();
 
         await interaction.update({
-            embeds: [updatedEmbed],
+            embeds: [embed],
             components: []
         });
 
-        const advertiser = await client.users
+        const user = await client.users
             .fetch(submission.userId)
             .catch(() => null);
 
-        if (advertiser) {
-            await advertiser.send(
-                `Your ServerSpot advertisement for **${interaction.guild.name}** was declined by the ServerSpot team.`
+        if (user) {
+            await user.send(
+                `Your ServerSpot advertisement in **${interaction.guild.name}** was declined by the staff team.`
             ).catch(() => {});
         }
 
-        configurations.delete(
-            `${interaction.guild.id}:${interaction.message.id}`
-        );
+        configurations.delete(key);
 
         return;
     }
@@ -499,14 +694,6 @@ async function handleReviewButton(interaction) {
     if (interaction.customId === "serverspot_accept") {
         const config = configurations.get(interaction.guild.id);
 
-        if (!config) {
-            return safeReply(interaction, {
-                content:
-                    "ServerSpot is not configured correctly. Please run `/setup` again.",
-                ephemeral: true
-            });
-        }
-
         const featuredChannel = await interaction.guild.channels
             .fetch(config.featuredChannelId)
             .catch(() => null);
@@ -514,29 +701,21 @@ async function handleReviewButton(interaction) {
         if (!featuredChannel || !featuredChannel.isTextBased()) {
             return safeReply(interaction, {
                 content:
-                    "The configured Featured Servers channel could not be found. Please run `/setup` again.",
+                    "The Featured Servers channel could not be found. Please run `/setup` again.",
                 ephemeral: true
             });
         }
 
-        // ----------------------------------------------------
-        // Get advertiser's server information
-        // ----------------------------------------------------
+        const guild = interaction.guild;
 
-        let serverName = interaction.guild.name;
-        let memberCount = interaction.guild.memberCount;
-        let serverIcon = interaction.guild.iconURL({
+        const serverIcon = guild.iconURL({
             size: 1024,
             extension: "png"
         });
 
-        // ----------------------------------------------------
-        // Featured advertisement
-        // ----------------------------------------------------
-
         const featuredEmbed = new EmbedBuilder()
             .setColor(COLOR)
-            .setTitle(serverName)
+            .setTitle(guild.name)
             .setDescription(submission.description)
             .addFields(
                 {
@@ -546,11 +725,11 @@ async function handleReviewButton(interaction) {
                 },
                 {
                     name: "Members",
-                    value: memberCount.toLocaleString(),
+                    value: guild.memberCount.toLocaleString(),
                     inline: true
                 },
                 {
-                    name: "Server Invite",
+                    name: "Invite",
                     value: `[Join Server](${submission.invite})`,
                     inline: true
                 },
@@ -565,7 +744,6 @@ async function handleReviewButton(interaction) {
             })
             .setTimestamp();
 
-        // User-supplied image takes priority.
         if (submission.image) {
             featuredEmbed.setThumbnail(submission.image);
         } else if (serverIcon) {
@@ -575,10 +753,6 @@ async function handleReviewButton(interaction) {
         await featuredChannel.send({
             embeds: [featuredEmbed]
         });
-
-        // ----------------------------------------------------
-        // Update review message
-        // ----------------------------------------------------
 
         const approvedEmbed = EmbedBuilder.from(
             interaction.message.embeds[0]
@@ -594,23 +768,17 @@ async function handleReviewButton(interaction) {
             components: []
         });
 
-        // ----------------------------------------------------
-        // Notify advertiser
-        // ----------------------------------------------------
-
-        const advertiser = await client.users
+        const user = await client.users
             .fetch(submission.userId)
             .catch(() => null);
 
-        if (advertiser) {
-            await advertiser.send(
-                `Your ServerSpot advertisement for **${interaction.guild.name}** has been **approved** and published in the Featured Servers channel.`
+        if (user) {
+            await user.send(
+                `Your ServerSpot advertisement for **${guild.name}** has been approved and published in Featured Servers.`
             ).catch(() => {});
         }
 
-        configurations.delete(
-            `${interaction.guild.id}:${interaction.message.id}`
-        );
+        configurations.delete(key);
     }
 }
 
@@ -618,7 +786,7 @@ async function handleReviewButton(interaction) {
 // SERVER INFO
 // ============================================================
 
-async function handleServerInfo(interaction) {
+async function serverInfo(interaction) {
     const guild = interaction.guild;
 
     const embed = new EmbedBuilder()
@@ -643,7 +811,9 @@ async function handleServerInfo(interaction) {
             },
             {
                 name: "Created",
-                value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`,
+                value: `<t:${Math.floor(
+                    guild.createdTimestamp / 1000
+                )}:D>`,
                 inline: true
             }
         )
@@ -661,12 +831,12 @@ async function handleServerInfo(interaction) {
 // HELP
 // ============================================================
 
-async function handleHelp(interaction) {
+async function help(interaction) {
     const embed = new EmbedBuilder()
         .setColor(COLOR)
         .setTitle("ServerSpot Commands")
         .setDescription(
-            "Use ServerSpot to discover and advertise Discord communities."
+            "Discover, advertise and connect with Discord communities."
         )
         .addFields(
             {
@@ -674,12 +844,12 @@ async function handleHelp(interaction) {
                 value:
                     "`/advertise` — Submit a server advertisement\n" +
                     "`/serverinfo` — View server information\n" +
-                    "`/help` — View this help menu"
+                    "`/help` — View available commands"
             },
             {
                 name: "Staff Commands",
                 value:
-                    "`/setup` — Configure advertisement logs and Featured Servers"
+                    "`/setup` — Configure ServerSpot channels"
             }
         )
         .setFooter({
@@ -693,20 +863,17 @@ async function handleHelp(interaction) {
 }
 
 // ============================================================
-// INTERACTION HANDLER
+// INTERACTIONS
 // ============================================================
 
 client.on("interactionCreate", async interaction => {
     try {
 
-        // -----------------------------
         // Slash commands
-        // -----------------------------
-
         if (interaction.isChatInputCommand()) {
 
             if (interaction.commandName === "setup") {
-                return await handleSetup(interaction);
+                return await openSetupPanel(interaction);
             }
 
             if (interaction.commandName === "advertise") {
@@ -714,18 +881,64 @@ client.on("interactionCreate", async interaction => {
             }
 
             if (interaction.commandName === "serverinfo") {
-                return await handleServerInfo(interaction);
+                return await serverInfo(interaction);
             }
 
             if (interaction.commandName === "help") {
-                return await handleHelp(interaction);
+                return await help(interaction);
             }
         }
 
-        // -----------------------------
-        // Modal submission
-        // -----------------------------
+        // Channel selectors
+        if (interaction.isChannelSelectMenu()) {
 
+            if (
+                interaction.customId ===
+                    "serverspot_setup_logs" ||
+                interaction.customId ===
+                    "serverspot_setup_featured"
+            ) {
+                return await handleSetupSelector(interaction);
+            }
+        }
+
+        // Setup buttons
+        if (interaction.isButton()) {
+
+            if (
+                interaction.customId ===
+                "serverspot_setup_save"
+            ) {
+                return await saveSetup(interaction);
+            }
+
+            if (
+                interaction.customId ===
+                "serverspot_setup_cancel"
+            ) {
+                configurations.delete(
+                    interaction.guild.id
+                );
+
+                return interaction.update({
+                    content:
+                        "ServerSpot setup cancelled.",
+                    embeds: [],
+                    components: []
+                });
+            }
+
+            if (
+                interaction.customId ===
+                    "serverspot_accept" ||
+                interaction.customId ===
+                    "serverspot_decline"
+            ) {
+                return await handleReview(interaction);
+            }
+        }
+
+        // Advertisement modal
         if (interaction.isModalSubmit()) {
 
             if (
@@ -736,22 +949,7 @@ client.on("interactionCreate", async interaction => {
             }
         }
 
-        // -----------------------------
-        // Buttons
-        // -----------------------------
-
-        if (interaction.isButton()) {
-
-            if (
-                interaction.customId === "serverspot_accept" ||
-                interaction.customId === "serverspot_decline"
-            ) {
-                return await handleReviewButton(interaction);
-            }
-        }
-
     } catch (error) {
-
         console.error(
             "Error while processing interaction:",
             error
@@ -759,14 +957,14 @@ client.on("interactionCreate", async interaction => {
 
         await safeReply(interaction, {
             content:
-                "Something went wrong while processing your request. Please try again or contact ServerSpot staff.",
+                "Something went wrong while processing your request. Please try again.",
             ephemeral: true
         });
     }
 });
 
 // ============================================================
-// GLOBAL ERROR PROTECTION
+// ERROR PROTECTION
 // ============================================================
 
 process.on("unhandledRejection", error => {
